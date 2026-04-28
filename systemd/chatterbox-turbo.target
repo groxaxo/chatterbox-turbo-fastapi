@@ -1,0 +1,7 @@
+[Unit]
+Description=Chatterbox Turbo TTS stack
+Wants=chatterbox-turbo-fastapi.service chatterbox-turbo-celery@2.service chatterbox-turbo-celery@3.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

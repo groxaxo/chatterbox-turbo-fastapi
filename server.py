@@ -4,7 +4,9 @@ import io
 import logging
 import os
 import random
+import re
 import secrets
+import subprocess
 import tempfile
 import threading
 import time
@@ -38,6 +40,7 @@ logger = logging.getLogger("chatterbox_api")
 
 DEVICE = os.getenv("DEVICE", "cuda")
 REQUIRE_CUDA = os.getenv("REQUIRE_CUDA", "1") == "1"
+EXPECTED_GPU_NAME = os.getenv("EXPECTED_GPU_NAME", "").strip()
 
 API_KEY = os.getenv("API_KEY", "").strip()
 ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
@@ -47,12 +50,28 @@ VOICE_DIR = Path(os.getenv("VOICE_DIR", "./voices")).resolve()
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "").strip()
 TMP_DIR = Path(os.getenv("TMP_DIR", tempfile.gettempdir())).resolve()
 
-MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "700"))
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "12000"))
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", os.getenv("MAX_CHUNK_CHARS", "360")))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 VOICE_CACHE_SIZE = int(os.getenv("VOICE_CACHE_SIZE", "8"))
 
+AUTO_CHUNK_ENABLED = os.getenv("AUTO_CHUNK_ENABLED", "1") == "1"
+AUTO_CHUNK_TARGET_CHARS = int(os.getenv("AUTO_CHUNK_TARGET_CHARS", str(MAX_TEXT_CHARS)))
+AUTO_CHUNK_HARD_LIMIT = int(os.getenv("AUTO_CHUNK_HARD_LIMIT", str(max(MAX_TEXT_CHARS, 420))))
+CHUNK_PAUSE_MS = int(os.getenv("CHUNK_PAUSE_MS", "140"))
+DEFAULT_RESPONSE_FORMAT = os.getenv("DEFAULT_RESPONSE_FORMAT", "mp3").strip().lower()
+
 WARMUP_TEXT = os.getenv("WARMUP_TEXT", "Warmup complete. [chuckle]")
-STARTUP_WARMUP = os.getenv("STARTUP_WARMUP", "1") == "1"
+STARTUP_WARMUP = os.getenv("STARTUP_WARMUP", "0") == "1"
+LAZY_LOAD_MODEL = os.getenv("LAZY_LOAD_MODEL", "1") == "1"
+MODEL_IDLE_UNLOAD_SECONDS = int(os.getenv("MODEL_IDLE_UNLOAD_SECONDS", "900"))
+MODEL_IDLE_CHECK_INTERVAL_SECONDS = int(os.getenv("MODEL_IDLE_CHECK_INTERVAL_SECONDS", "30"))
+
+ENABLE_CELERY = os.getenv("ENABLE_CELERY", "0") == "1"
+CELERY_TASK_TIMEOUT_SECONDS = int(os.getenv("CELERY_TASK_TIMEOUT_SECONDS", "300"))
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://127.0.0.1:6379/14")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
+CELERY_QUEUE = os.getenv("CELERY_QUEUE", "chatterbox_tts")
 
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.8"))
 DEFAULT_TOP_P = float(os.getenv("DEFAULT_TOP_P", "0.95"))
@@ -61,6 +80,10 @@ DEFAULT_REPETITION_PENALTY = float(os.getenv("DEFAULT_REPETITION_PENALTY", "1.2"
 DEFAULT_NORM_LOUDNESS = os.getenv("DEFAULT_NORM_LOUDNESS", "1") == "1"
 
 ALLOWED_AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+SUPPORTED_TTS_MODELS = {"tts-1", "tts-1-hd"}
+DEFAULT_VOICE_ALIASES = {"default", "alloy"}
+SUPPORTED_RESPONSE_FORMATS = {"wav", "mp3", "json_base64"}
+WORKER_GPU_INDICES = os.getenv("WORKER_GPU_INDICES", "2,3").strip()
 
 
 # -----------------------------
@@ -73,6 +96,10 @@ model_lock = threading.Lock()
 # key -> Conditionals object from chatterbox.tts_turbo
 conditionals_cache: "OrderedDict[str, Any]" = OrderedDict()
 voice_digest_cache: "OrderedDict[str, tuple[tuple[int, int, int, int], str]]" = OrderedDict()
+
+device_configured = False
+model_last_used_monotonic = 0.0
+idle_monitor_started = False
 
 
 # -----------------------------
@@ -103,8 +130,17 @@ async def require_api_key(request: Request) -> None:
 # Utility
 # -----------------------------
 
+def ensure_dirs() -> None:
+    VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def configure_torch() -> str:
     global DEVICE
+    global device_configured
+
+    if device_configured:
+        return DEVICE
 
     torch.set_grad_enabled(False)
 
@@ -114,12 +150,106 @@ def configure_torch() -> str:
                 raise RuntimeError("DEVICE=cuda requested, but torch.cuda.is_available() is false.")
             DEVICE = "cpu"
         else:
+            gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+            if EXPECTED_GPU_NAME and EXPECTED_GPU_NAME.lower() not in gpu_name.lower():
+                raise RuntimeError(
+                    f"Selected GPU '{gpu_name}' does not match EXPECTED_GPU_NAME='{EXPECTED_GPU_NAME}'."
+                )
+
             # RTX 3060 / 3090 are Ampere. TF32 improves matmul/conv speed with negligible TTS impact.
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
 
+    device_configured = True
     return DEVICE
+
+
+def touch_model_usage() -> None:
+    global model_last_used_monotonic
+    model_last_used_monotonic = time.monotonic()
+
+
+def resolve_default_voice_path() -> Optional[Path]:
+    candidates: list[Path] = []
+    if DEFAULT_VOICE:
+        candidates.append(Path(DEFAULT_VOICE).resolve())
+    candidates.append((VOICE_DIR / "default.wav").resolve())
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def unload_model_locked(reason: str) -> None:
+    global model
+
+    if model is None:
+        return
+
+    logger.info("Unloading Chatterbox model (%s).", reason)
+    model = None
+    conditionals_cache.clear()
+    voice_digest_cache.clear()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def idle_unload_loop() -> None:
+    while True:
+        time.sleep(max(5, MODEL_IDLE_CHECK_INTERVAL_SECONDS))
+        if MODEL_IDLE_UNLOAD_SECONDS <= 0:
+            continue
+
+        idle_for = time.monotonic() - model_last_used_monotonic
+        if model is None or idle_for < MODEL_IDLE_UNLOAD_SECONDS:
+            continue
+
+        with model_lock:
+            idle_for = time.monotonic() - model_last_used_monotonic
+            if model is not None and idle_for >= MODEL_IDLE_UNLOAD_SECONDS:
+                unload_model_locked(f"idle for {int(idle_for)}s")
+
+
+def ensure_idle_monitor_started() -> None:
+    global idle_monitor_started
+
+    if idle_monitor_started or MODEL_IDLE_UNLOAD_SECONDS <= 0:
+        return
+
+    threading.Thread(target=idle_unload_loop, name="chatterbox-idle-unloader", daemon=True).start()
+    idle_monitor_started = True
+
+
+def ensure_model_loaded_locked() -> ChatterboxTurboTTS:
+    global model
+
+    if model is not None:
+        touch_model_usage()
+        return model
+
+    final_device = configure_torch()
+    logger.info("Loading Chatterbox Turbo on %s...", final_device)
+    model = ChatterboxTurboTTS.from_pretrained(device=final_device)
+
+    default_path = resolve_default_voice_path()
+    if default_path is not None:
+        logger.info("Preparing default voice conditionals: %s", default_path)
+        default_conds, _ = get_or_prepare_conditionals(default_path, norm_loudness=DEFAULT_NORM_LOUDNESS)
+        model.conds = default_conds
+    else:
+        logger.warning("No default voice reference file found. Requests must provide a voice file.")
+
+    touch_model_usage()
+    ensure_idle_monitor_started()
+    return model
 
 
 def set_seed(seed: int) -> None:
@@ -143,16 +273,13 @@ def validate_generation_args(
     top_k: int,
     repetition_penalty: float,
 ) -> None:
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded.")
-
     if not text or not text.strip():
         raise HTTPException(status_code=400, detail="Text is empty.")
 
-    if len(text) > MAX_TEXT_CHARS:
+    if len(text) > MAX_INPUT_CHARS:
         raise HTTPException(
             status_code=400,
-            detail=f"Text too long. Max is {MAX_TEXT_CHARS} chars. For realtime calls, chunk hard.",
+            detail=f"Text too long. Max input size is {MAX_INPUT_CHARS} chars.",
         )
 
     if not 0.05 <= temperature <= 2.0:
@@ -171,14 +298,16 @@ def validate_generation_args(
 def normalize_voice_path(voice: Optional[str]) -> Optional[Path]:
     """
     JSON endpoint voice resolution.
-    - empty/default -> DEFAULT_VOICE
-    - plain filename -> VOICE_DIR / filename  (no path traversal allowed)
+    - empty/default/alloy -> DEFAULT_VOICE (or voices/default.wav fallback)
+    - plain filename -> VOICE_DIR / filename
     - absolute path -> only when ALLOW_ABSOLUTE_VOICE_PATHS=1
     """
-    if not voice or voice == "default":
-        return Path(DEFAULT_VOICE).resolve() if DEFAULT_VOICE else None
+    if not voice or voice in DEFAULT_VOICE_ALIASES:
+        return resolve_default_voice_path()
 
     raw = voice.strip()
+    if raw in DEFAULT_VOICE_ALIASES:
+        return resolve_default_voice_path()
 
     if os.path.isabs(raw):
         if os.getenv("ALLOW_ABSOLUTE_VOICE_PATHS", "0") != "1":
@@ -190,7 +319,6 @@ def normalize_voice_path(voice: Optional[str]) -> Optional[Path]:
         if any(sep and sep in raw for sep in bad_seps):
             raise HTTPException(status_code=400, detail="Voice name must be a plain filename, not a path.")
         p = (VOICE_DIR / raw).resolve()
-        # Belt-and-suspenders: ensure the resolved path stays inside VOICE_DIR.
         if not p.is_relative_to(VOICE_DIR.resolve()):
             raise HTTPException(status_code=404, detail=f"Voice file not found: {voice}")
 
@@ -247,7 +375,7 @@ async def save_upload(upload: UploadFile) -> Path:
             detail=f"Unsupported voice file extension '{suffix}'. Allowed: {', '.join(sorted(ALLOWED_AUDIO_SUFFIXES))}",
         )
 
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_dirs()
     out_path = TMP_DIR / f"chatterbox_voice_{uuid.uuid4().hex}{suffix}"
     out_path.write_bytes(data)
     return out_path
@@ -259,18 +387,15 @@ def cache_key_for_voice(path: Path, norm_loudness: bool) -> str:
 
 def get_or_prepare_conditionals(voice_path: Path, norm_loudness: bool) -> tuple[Any, bool]:
     """
-    Critical speed trick.
     ChatterboxTurboTTS.generate(audio_prompt_path=...) calls prepare_conditionals every time.
     We instead prepare once, cache model.conds, then call generate(..., audio_prompt_path=None).
-
-    Must be called under model_lock because prepare_conditionals mutates model.conds.
     """
     if model is None:
         raise RuntimeError("Model is not loaded.")
 
     key = cache_key_for_voice(voice_path, norm_loudness)
-
     cached = conditionals_cache.get(key)
+
     if cached is not None:
         conditionals_cache.move_to_end(key)
         return cached, True
@@ -287,7 +412,7 @@ def get_or_prepare_conditionals(voice_path: Path, norm_loudness: bool) -> tuple[
     return conds, False
 
 
-def wav_tensor_to_wav_bytes(wav: torch.Tensor, sample_rate: int) -> bytes:
+def tensor_to_float_array(wav: torch.Tensor | np.ndarray | list[float]) -> np.ndarray:
     if isinstance(wav, torch.Tensor):
         wav = wav.detach()
         if wav.device.type != "cpu":
@@ -297,7 +422,6 @@ def wav_tensor_to_wav_bytes(wav: torch.Tensor, sample_rate: int) -> bytes:
     else:
         wav = torch.as_tensor(wav, dtype=torch.float32)
 
-    # Chatterbox returns [1, samples]. SoundFile wants [samples] or [samples, channels].
     if wav.ndim == 2 and wav.shape[0] == 1:
         arr = wav.squeeze(0).numpy()
     elif wav.ndim == 1:
@@ -305,16 +429,138 @@ def wav_tensor_to_wav_bytes(wav: torch.Tensor, sample_rate: int) -> bytes:
     else:
         arr = wav.squeeze().numpy()
 
-    # Keep TTS output standard and API-friendly.
-    arr = np.clip(arr, -1.0, 1.0)
+    return np.clip(arr.astype(np.float32, copy=False), -1.0, 1.0)
 
+
+def wav_bytes_from_array(arr: np.ndarray, sample_rate: int) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, arr, sample_rate, format="WAV", subtype="PCM_16")
     buf.seek(0)
     return buf.read()
 
 
-def generate_locked(
+def mp3_bytes_from_array(arr: np.ndarray, sample_rate: int) -> bytes:
+    wav_bytes = wav_bytes_from_array(arr, sample_rate)
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-f",
+        "mp3",
+        "-codec:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        "pipe:1",
+    ]
+    try:
+        result = subprocess.run(cmd, input=wav_bytes, capture_output=True, check=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg is required for MP3 output but was not found on PATH.") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"ffmpeg failed to encode MP3 output: {exc.stderr.decode('utf-8', errors='ignore')}") from exc
+    return result.stdout
+
+
+def encode_audio_bytes(arr: np.ndarray, sample_rate: int, output_format: str) -> tuple[bytes, str, str]:
+    if output_format == "wav":
+        return wav_bytes_from_array(arr, sample_rate), "audio/wav", "wav"
+    if output_format == "mp3":
+        return mp3_bytes_from_array(arr, sample_rate), "audio/mpeg", "mp3"
+    raise RuntimeError(f"Unsupported output format: {output_format}")
+
+
+def split_oversized_unit(text: str, hard_limit: int) -> list[str]:
+    text = text.strip()
+    if len(text) <= hard_limit:
+        return [text]
+
+    pieces: list[str] = []
+    current = ""
+    for clause in re.split(r"(?<=[,;:])\s+", text):
+        clause = clause.strip()
+        if not clause:
+            continue
+        candidate = clause if not current else f"{current} {clause}"
+        if current and len(candidate) > hard_limit:
+            pieces.extend(split_oversized_unit(current, hard_limit))
+            current = clause
+        else:
+            current = candidate
+
+    if current:
+        if len(current) <= hard_limit:
+            pieces.append(current)
+        else:
+            words = current.split()
+            bucket = ""
+            for word in words:
+                candidate = word if not bucket else f"{bucket} {word}"
+                if bucket and len(candidate) > hard_limit:
+                    pieces.append(bucket)
+                    bucket = word
+                else:
+                    bucket = candidate
+            if bucket:
+                pieces.append(bucket)
+
+    return [piece for piece in pieces if piece]
+
+
+def chunk_text_for_tts(text: str) -> list[str]:
+    cleaned = re.sub(r"[ \t]+", " ", text.strip())
+    if not cleaned:
+        return []
+
+    if not AUTO_CHUNK_ENABLED or len(cleaned) <= AUTO_CHUNK_HARD_LIMIT:
+        return [cleaned]
+
+    units = [u.strip() for u in re.split(r"(?<=[.!?])\s+|\n+", cleaned) if u.strip()]
+    if not units:
+        return [cleaned]
+
+    chunks: list[str] = []
+    current = ""
+
+    for unit in units:
+        for fragment in split_oversized_unit(unit, AUTO_CHUNK_HARD_LIMIT):
+            candidate = fragment if not current else f"{current} {fragment}"
+            if current and len(candidate) > AUTO_CHUNK_HARD_LIMIT:
+                chunks.append(current)
+                current = fragment
+            else:
+                current = candidate
+
+            if len(current) >= AUTO_CHUNK_TARGET_CHARS:
+                chunks.append(current)
+                current = ""
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def concatenate_audio_arrays(chunks: list[np.ndarray], sample_rate: int) -> np.ndarray:
+    if not chunks:
+        return np.zeros(0, dtype=np.float32)
+
+    pause_samples = max(0, int(sample_rate * (CHUNK_PAUSE_MS / 1000.0)))
+    silence = np.zeros(pause_samples, dtype=np.float32)
+
+    merged: list[np.ndarray] = []
+    for idx, chunk in enumerate(chunks):
+        if idx > 0 and pause_samples > 0:
+            merged.append(silence)
+        merged.append(chunk.astype(np.float32, copy=False))
+
+    return np.concatenate(merged) if len(merged) > 1 else merged[0]
+
+
+def generate_chunk_locked(
     *,
     text: str,
     voice_path: Optional[Path],
@@ -324,26 +570,20 @@ def generate_locked(
     repetition_penalty: float,
     norm_loudness: bool,
     seed: int,
-) -> tuple[bytes, dict[str, Any]]:
-    if model is None:
-        raise RuntimeError("Model is not loaded.")
-
-    started = time.perf_counter()
-    voice_cache_hit = False
-
+) -> tuple[np.ndarray, int, bool]:
     with model_lock:
-        # Seed inside the lock so concurrent requests don't clobber each other's RNG state.
+        loaded_model = ensure_model_loaded_locked()
         set_seed(seed)
 
+        voice_cache_hit = False
         if voice_path is not None:
             conds, voice_cache_hit = get_or_prepare_conditionals(voice_path, norm_loudness=norm_loudness)
-            model.conds = conds
-        elif model.conds is None:
+            loaded_model.conds = conds
+        elif loaded_model.conds is None:
             raise RuntimeError("No default voice conditionals are loaded. Provide a voice file or set DEFAULT_VOICE.")
 
         with torch.inference_mode():
-            # Turbo currently ignores min_p, cfg_weight, and exaggeration. Do not expose fake knobs.
-            wav = model.generate(
+            wav = loaded_model.generate(
                 text.strip(),
                 audio_prompt_path=None,
                 temperature=float(temperature),
@@ -353,14 +593,62 @@ def generate_locked(
                 norm_loudness=bool(norm_loudness),
             )
 
-        sample_rate = int(model.sr)
-
+        sample_rate = int(loaded_model.sr)
         if DEVICE.startswith("cuda"):
             torch.cuda.synchronize()
 
+        touch_model_usage()
+        return tensor_to_float_array(wav), sample_rate, voice_cache_hit
+
+
+def synthesize_request_sync(
+    *,
+    text: str,
+    voice_path: Optional[Path],
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    norm_loudness: bool,
+    seed: int,
+    output_format: str,
+) -> tuple[bytes, dict[str, Any]]:
+    started = time.perf_counter()
+    chunks = chunk_text_for_tts(text)
+
+    if not chunks:
+        raise RuntimeError("No text chunks were produced.")
+
+    sample_rate: Optional[int] = None
+    arrays: list[np.ndarray] = []
+    voice_cache_hits: list[bool] = []
+
+    for idx, chunk in enumerate(chunks):
+        chunk_seed = (seed + idx) if seed > 0 else 0
+        arr, chunk_sample_rate, voice_cache_hit = generate_chunk_locked(
+            text=chunk,
+            voice_path=voice_path,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            norm_loudness=norm_loudness,
+            seed=chunk_seed,
+        )
+        if sample_rate is None:
+            sample_rate = chunk_sample_rate
+        elif sample_rate != chunk_sample_rate:
+            raise RuntimeError("Mismatched sample rates while concatenating synthesized chunks.")
+
+        arrays.append(arr)
+        voice_cache_hits.append(voice_cache_hit)
+
+    assert sample_rate is not None
+    combined = concatenate_audio_arrays(arrays, sample_rate)
+    audio_bytes, content_type, extension = encode_audio_bytes(combined, sample_rate, output_format)
+
     elapsed = time.perf_counter() - started
-    audio_seconds = float(wav.shape[-1] / sample_rate)
-    wav_bytes = wav_tensor_to_wav_bytes(wav, sample_rate)
+    audio_seconds = float(combined.shape[-1] / sample_rate) if sample_rate > 0 else 0.0
 
     meta = {
         "sample_rate": sample_rate,
@@ -369,28 +657,151 @@ def generate_locked(
         "rtf": round(elapsed / audio_seconds, 4) if audio_seconds > 0 else None,
         "x_realtime": round(audio_seconds / elapsed, 4) if elapsed > 0 else None,
         "device": DEVICE,
-        "voice_cached": voice_cache_hit,
+        "voice_cached": any(voice_cache_hits),
         "cache_entries": len(conditionals_cache),
+        "chunk_count": len(chunks),
+        "chunk_target_chars": AUTO_CHUNK_TARGET_CHARS,
+        "chunk_hard_limit": AUTO_CHUNK_HARD_LIMIT,
+        "lazy_loaded": LAZY_LOAD_MODEL,
+        "model_loaded": model is not None,
+        "output_format": output_format,
+        "content_type": content_type,
+        "filename": f"speech.{extension}",
     }
 
-    return wav_bytes, meta
+    return audio_bytes, meta
 
 
-def response_with_audio(wav_bytes: bytes, meta: dict[str, Any]) -> Response:
+def synthesize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    voice_path = Path(payload["voice_path"]).resolve() if payload.get("voice_path") else None
+    wav_bytes, meta = synthesize_request_sync(
+        text=payload["text"],
+        voice_path=voice_path,
+        temperature=float(payload["temperature"]),
+        top_p=float(payload["top_p"]),
+        top_k=int(payload["top_k"]),
+        repetition_penalty=float(payload["repetition_penalty"]),
+        norm_loudness=bool(payload["norm_loudness"]),
+        seed=int(payload["seed"]),
+        output_format=str(payload.get("output_format", DEFAULT_RESPONSE_FORMAT)),
+    )
+    return {
+        "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
+        "metadata": meta,
+    }
+
+
+def response_with_audio(audio_bytes: bytes, meta: dict[str, Any]) -> Response:
     headers: dict[str, str] = {
-        "Content-Disposition": 'attachment; filename="speech.wav"',
+        "Content-Disposition": f'attachment; filename="{meta["filename"]}"',
         "X-Sample-Rate": str(meta["sample_rate"]),
         "X-Wall-Seconds": str(meta["wall_seconds"]),
         "X-Audio-Seconds": str(meta["audio_seconds"]),
         "X-Voice-Cached": str(meta["voice_cached"]).lower(),
         "X-Voice-Cache-Entries": str(meta["cache_entries"]),
+        "X-Chunk-Count": str(meta["chunk_count"]),
+        "X-Chunk-Target-Chars": str(meta["chunk_target_chars"]),
+        "X-Output-Format": str(meta["output_format"]),
     }
-    # Only include performance-ratio headers when they were successfully computed.
     if meta.get("rtf") is not None:
         headers["X-RTF"] = str(meta["rtf"])
     if meta.get("x_realtime") is not None:
         headers["X-Speed-X-Realtime"] = str(meta["x_realtime"])
-    return Response(content=wav_bytes, media_type="audio/wav", headers=headers)
+    return Response(content=audio_bytes, media_type=meta["content_type"], headers=headers)
+
+
+def available_models_payload() -> dict[str, list[dict[str, str]]]:
+    return {
+        "models": [
+            {"id": "tts-1", "name": "Chatterbox Turbo (standard)"},
+            {"id": "tts-1-hd", "name": "Chatterbox Turbo (hd alias)"},
+        ]
+    }
+
+
+def available_voices_payload() -> dict[str, list[dict[str, str]]]:
+    ensure_dirs()
+    voices = [
+        {"id": "alloy", "name": "alloy (default reference voice)"},
+        {"id": "default", "name": "default"},
+    ]
+    for path in sorted(VOICE_DIR.iterdir()):
+        if path.is_file() and path.suffix.lower() in ALLOWED_AUDIO_SUFFIXES:
+            voices.append({"id": path.name, "name": path.name})
+    deduped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for voice in voices:
+        if voice["id"] in seen:
+            continue
+        seen.add(voice["id"])
+        deduped.append(voice)
+    return {"voices": deduped}
+
+
+def runtime_status(include_sensitive: bool = True) -> dict[str, Any]:
+    default_voice_path = resolve_default_voice_path()
+    gpu = None
+
+    if include_sensitive and DEVICE.startswith("cuda") and torch.cuda.is_available():
+        try:
+            idx = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(idx)
+            gpu = {
+                "name": torch.cuda.get_device_name(idx),
+                "index": idx,
+                "total_vram_gb": round(props.total_memory / 1024**3, 2),
+                "allocated_gb": round(torch.cuda.memory_allocated(idx) / 1024**3, 3),
+                "reserved_gb": round(torch.cuda.memory_reserved(idx) / 1024**3, 3),
+            }
+        except Exception:
+            gpu = None
+
+    return {
+        "ok": True,
+        "backend_mode": "celery" if ENABLE_CELERY else "direct",
+        "device": DEVICE,
+        "cuda_available": torch.cuda.is_available(),
+        "gpu": gpu,
+        "expected_gpu_name": EXPECTED_GPU_NAME or ("RTX 3060" if ENABLE_CELERY else None),
+        "model_loaded": model is not None,
+        "lazy_load_model": LAZY_LOAD_MODEL,
+        "model_idle_unload_seconds": MODEL_IDLE_UNLOAD_SECONDS,
+        "sample_rate": int(model.sr) if model else 24000,
+        "default_voice": str(default_voice_path) if default_voice_path else None,
+        "voice_dir": str(VOICE_DIR),
+        "max_input_chars": MAX_INPUT_CHARS,
+        "chunk_target_chars": AUTO_CHUNK_TARGET_CHARS,
+        "chunk_hard_limit": AUTO_CHUNK_HARD_LIMIT,
+        "auto_chunk_enabled": AUTO_CHUNK_ENABLED,
+        "default_response_format": DEFAULT_RESPONSE_FORMAT,
+        "worker_gpu_indices": WORKER_GPU_INDICES or None,
+        "voice_cache_entries": len(conditionals_cache),
+        "voice_cache_size": VOICE_CACHE_SIZE,
+        "celery_queue": CELERY_QUEUE if ENABLE_CELERY else None,
+    }
+
+
+def wait_for_celery_result(task) -> tuple[bytes, dict[str, Any]]:
+    deadline = time.monotonic() + CELERY_TASK_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if task.ready():
+            break
+        time.sleep(0.1)
+    else:
+        raise HTTPException(status_code=504, detail="Timed out waiting for Celery synthesis task.")
+
+    if task.failed():
+        raise RuntimeError(str(task.result))
+
+    payload = task.result
+    if not isinstance(payload, dict):
+        raise RuntimeError("Celery synthesis task returned an unexpected payload type.")
+
+    audio_base64 = payload.get("audio_base64")
+    if not audio_base64:
+        raise RuntimeError("Celery synthesis task returned no audio payload.")
+
+    return base64.b64decode(audio_base64), payload["metadata"]
 
 
 # -----------------------------
@@ -399,66 +810,42 @@ def response_with_audio(wav_bytes: bytes, meta: dict[str, Any]) -> Response:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model
+    ensure_dirs()
+    ensure_idle_monitor_started()
 
-    # Warn loudly if the API key is still the placeholder value.
-    _key = os.getenv("API_KEY", "")
-    if not _key or _key == "change-this-key":
-        logger.warning(
-            "API_KEY is unset or still the placeholder 'change-this-key'. "
-            "The server is accessible without authentication — set a strong API_KEY before exposing this service."
-        )
+    if not ALLOW_NO_AUTH and API_KEY in _PLACEHOLDER_API_KEYS:
+        logger.warning("API_KEY is unset. Authenticated endpoints will return 503 until configured.")
 
-    final_device = configure_torch()
-    logger.info("Loading Chatterbox Turbo on %s...", final_device)
-
-    model = ChatterboxTurboTTS.from_pretrained(device=final_device)
-
-    VOICE_DIR.mkdir(parents=True, exist_ok=True)
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-    if DEFAULT_VOICE:
-        default_path = Path(DEFAULT_VOICE).resolve()
-        if not default_path.exists():
-            raise RuntimeError(f"DEFAULT_VOICE does not exist: {default_path}")
-
-        logger.info("Preparing default voice conditionals: %s", default_path)
+    if not LAZY_LOAD_MODEL and not ENABLE_CELERY:
         with model_lock:
-            default_conds, _ = get_or_prepare_conditionals(default_path, norm_loudness=DEFAULT_NORM_LOUDNESS)
-            model.conds = default_conds
+            ensure_model_loaded_locked()
 
-    if STARTUP_WARMUP:
-        logger.info("Running warmup...")
-        try:
-            # If DEFAULT_VOICE exists, this uses cached conditionals. If not, built-in conds may exist.
-            generate_locked(
-                text=WARMUP_TEXT,
-                voice_path=Path(DEFAULT_VOICE).resolve() if DEFAULT_VOICE else None,
-                temperature=DEFAULT_TEMPERATURE,
-                top_p=DEFAULT_TOP_P,
-                top_k=DEFAULT_TOP_K,
-                repetition_penalty=DEFAULT_REPETITION_PENALTY,
-                norm_loudness=DEFAULT_NORM_LOUDNESS,
-                seed=0,
-            )
-            logger.info("Warmup complete.")
-        except Exception as e:
-            logger.warning("Warmup skipped/failed: %s: %s", type(e).__name__, e)
+        if STARTUP_WARMUP:
+            logger.info("Running startup warmup...")
+            try:
+                synthesize_request_sync(
+                    text=WARMUP_TEXT,
+                    voice_path=resolve_default_voice_path(),
+                    temperature=DEFAULT_TEMPERATURE,
+                    top_p=DEFAULT_TOP_P,
+                    top_k=DEFAULT_TOP_K,
+                    repetition_penalty=DEFAULT_REPETITION_PENALTY,
+                    norm_loudness=DEFAULT_NORM_LOUDNESS,
+                    seed=0,
+                )
+                logger.info("Warmup complete.")
+            except Exception as exc:
+                logger.warning("Warmup skipped/failed: %s: %s", type(exc).__name__, exc)
 
     yield
 
-    logger.info("Releasing Chatterbox model.")
-    model = None
-    conditionals_cache.clear()
-    voice_digest_cache.clear()
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    with model_lock:
+        unload_model_locked("shutdown")
 
 
 app = FastAPI(
     title="Chatterbox Turbo FastAPI",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -469,14 +856,15 @@ app = FastAPI(
 
 class SpeechRequest(BaseModel):
     input: str = Field(..., description="Text to synthesize")
-    voice: str = Field("default", description="'default' or a filename inside VOICE_DIR")
+    model: str = Field("tts-1", description="tts-1 or tts-1-hd")
+    voice: str = Field("alloy", description="'alloy', 'default', or a filename inside VOICE_DIR")
     temperature: float = DEFAULT_TEMPERATURE
     top_p: float = DEFAULT_TOP_P
     top_k: int = DEFAULT_TOP_K
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY
     norm_loudness: bool = DEFAULT_NORM_LOUDNESS
     seed: int = 0
-    response_format: str = Field("wav", description="wav or json_base64")
+    response_format: str = Field(DEFAULT_RESPONSE_FORMAT, description="mp3, wav, or json_base64")
 
 
 async def run_generation(
@@ -489,9 +877,27 @@ async def run_generation(
     repetition_penalty: float,
     norm_loudness: bool,
     seed: int,
+    output_format: str,
 ) -> tuple[bytes, dict[str, Any]]:
+    if ENABLE_CELERY:
+        from celery_worker import celery_app
+
+        payload = {
+            "text": text,
+            "voice_path": str(voice_path) if voice_path else None,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repetition_penalty": repetition_penalty,
+            "norm_loudness": norm_loudness,
+            "seed": seed,
+            "output_format": output_format,
+        }
+        task = celery_app.send_task("chatterbox_turbo.synthesize", kwargs={"payload": payload}, queue=CELERY_QUEUE)
+        return await anyio.to_thread.run_sync(lambda: wait_for_celery_result(task), abandon_on_cancel=False)
+
     return await anyio.to_thread.run_sync(
-        lambda: generate_locked(
+        lambda: synthesize_request_sync(
             text=text,
             voice_path=voice_path,
             temperature=temperature,
@@ -500,6 +906,7 @@ async def run_generation(
             repetition_penalty=repetition_penalty,
             norm_loudness=norm_loudness,
             seed=seed,
+            output_format=output_format,
         ),
         abandon_on_cancel=False,
     )
@@ -511,54 +918,48 @@ async def run_generation(
 
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
-    """Minimal liveness probe — safe to expose without authentication."""
-    return {"ok": model is not None}
+    return {
+        "ok": True,
+        "backend_mode": "celery" if ENABLE_CELERY else "direct",
+        "model_loaded": model is not None,
+    }
 
 
 @app.get("/status", dependencies=[Depends(require_api_key)])
 def status() -> dict[str, Any]:
-    """Detailed runtime status — requires authentication."""
-    gpu = None
-
-    if torch.cuda.is_available():
-        idx = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(idx)
-        gpu = {
-            "name": torch.cuda.get_device_name(idx),
-            "index": idx,
-            "total_vram_gb": round(props.total_memory / 1024**3, 2),
-            "allocated_gb": round(torch.cuda.memory_allocated(idx) / 1024**3, 3),
-            "reserved_gb": round(torch.cuda.memory_reserved(idx) / 1024**3, 3),
-        }
-
-    return {
-        "ok": model is not None,
-        "device": DEVICE,
-        "cuda_available": torch.cuda.is_available(),
-        "gpu": gpu,
-        "sample_rate": int(model.sr) if model else None,
-        "default_voice": DEFAULT_VOICE or None,
-        "voice_dir": str(VOICE_DIR),
-        "max_text_chars": MAX_TEXT_CHARS,
-        "voice_cache_entries": len(conditionals_cache),
-        "voice_cache_size": VOICE_CACHE_SIZE,
-    }
+    return runtime_status(include_sensitive=True)
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    """Backwards-compatible alias for /healthz."""
     return healthz()
 
 
 @app.get("/voices", dependencies=[Depends(require_api_key)])
-def voices() -> dict[str, list[str]]:
-    VOICE_DIR.mkdir(parents=True, exist_ok=True)
+def voices() -> dict[str, list[dict[str, str]]]:
+    return available_voices_payload()
+
+
+@app.get("/audio/models", dependencies=[Depends(require_api_key)])
+@app.get("/v1/audio/models", dependencies=[Depends(require_api_key)])
+def audio_models() -> dict[str, list[dict[str, str]]]:
+    return available_models_payload()
+
+
+@app.get("/audio/voices", dependencies=[Depends(require_api_key)])
+@app.get("/v1/audio/voices", dependencies=[Depends(require_api_key)])
+def audio_voices() -> dict[str, list[dict[str, str]]]:
+    return available_voices_payload()
+
+
+@app.get("/v1/models", dependencies=[Depends(require_api_key)])
+def openai_models() -> dict[str, Any]:
     return {
-        "voices": sorted(
-            p.name for p in VOICE_DIR.iterdir()
-            if p.is_file() and p.suffix.lower() in ALLOWED_AUDIO_SUFFIXES
-        )
+        "object": "list",
+        "data": [
+            {"id": "tts-1", "object": "model", "owned_by": "groxaxo"},
+            {"id": "tts-1-hd", "object": "model", "owned_by": "groxaxo"},
+        ],
     }
 
 
@@ -572,6 +973,7 @@ async def tts_multipart(
     repetition_penalty: float = Form(DEFAULT_REPETITION_PENALTY),
     norm_loudness: bool = Form(DEFAULT_NORM_LOUDNESS),
     seed: int = Form(0),
+    response_format: str = Form(DEFAULT_RESPONSE_FORMAT),
 ):
     validate_generation_args(
         text=text,
@@ -581,6 +983,9 @@ async def tts_multipart(
         repetition_penalty=repetition_penalty,
     )
 
+    if response_format not in {"wav", "mp3"}:
+        raise HTTPException(status_code=400, detail="response_format must be 'wav' or 'mp3'.")
+
     uploaded_path: Optional[Path] = None
 
     try:
@@ -588,7 +993,7 @@ async def tts_multipart(
             uploaded_path = await save_upload(voice)
             voice_path = uploaded_path
         else:
-            voice_path = normalize_voice_path("default")
+            voice_path = normalize_voice_path("alloy")
 
         wav_bytes, meta = await run_generation(
             text=text,
@@ -599,6 +1004,7 @@ async def tts_multipart(
             repetition_penalty=repetition_penalty,
             norm_loudness=norm_loudness,
             seed=seed,
+            output_format=response_format,
         )
 
         return response_with_audio(wav_bytes, meta)
@@ -608,7 +1014,7 @@ async def tts_multipart(
     except AssertionError:
         logger.exception("TTS assertion failed (multipart)")
         raise HTTPException(status_code=400, detail="Invalid TTS request.")
-    except Exception as e:
+    except Exception:
         logger.exception("TTS generation failed (multipart)")
         raise HTTPException(status_code=500, detail="TTS failed. Check server logs.")
     finally:
@@ -626,8 +1032,14 @@ async def openai_style_speech(req: SpeechRequest):
         repetition_penalty=req.repetition_penalty,
     )
 
-    if req.response_format not in {"wav", "json_base64"}:
-        raise HTTPException(status_code=400, detail="response_format must be 'wav' or 'json_base64'.")
+    if req.model not in SUPPORTED_TTS_MODELS:
+        raise HTTPException(status_code=400, detail=f"model must be one of: {', '.join(sorted(SUPPORTED_TTS_MODELS))}")
+
+    if req.response_format not in SUPPORTED_RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"response_format must be one of: {', '.join(sorted(SUPPORTED_RESPONSE_FORMATS))}.",
+        )
 
     voice_path = normalize_voice_path(req.voice)
 
@@ -641,6 +1053,7 @@ async def openai_style_speech(req: SpeechRequest):
             repetition_penalty=req.repetition_penalty,
             norm_loudness=req.norm_loudness,
             seed=req.seed,
+            output_format="mp3" if req.response_format == "json_base64" else req.response_format,
         )
 
         if req.response_format == "json_base64":
@@ -659,7 +1072,7 @@ async def openai_style_speech(req: SpeechRequest):
     except AssertionError:
         logger.exception("TTS assertion failed (OpenAI speech endpoint)")
         raise HTTPException(status_code=400, detail="Invalid TTS request.")
-    except Exception as e:
+    except Exception:
         logger.exception("TTS generation failed (OpenAI speech endpoint)")
         raise HTTPException(status_code=500, detail="TTS failed. Check server logs.")
 
@@ -667,7 +1080,7 @@ async def openai_style_speech(req: SpeechRequest):
 @app.post("/warmup", dependencies=[Depends(require_api_key)])
 async def warmup():
     try:
-        voice_path = normalize_voice_path("default")
+        voice_path = normalize_voice_path("alloy")
         wav_bytes, meta = await run_generation(
             text=WARMUP_TEXT,
             voice_path=voice_path,
@@ -677,10 +1090,11 @@ async def warmup():
             repetition_penalty=DEFAULT_REPETITION_PENALTY,
             norm_loudness=DEFAULT_NORM_LOUDNESS,
             seed=0,
+            output_format="wav",
         )
         return {"ok": True, "metadata": meta, "bytes": len(wav_bytes)}
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("Warmup failed")
         raise HTTPException(status_code=500, detail="Warmup failed. Check server logs.")

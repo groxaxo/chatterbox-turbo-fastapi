@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-API="${API:-http://127.0.0.1:8011}"
+API="${API:-http://127.0.0.1:7766}"
 KEY="${API_KEY:?API_KEY must be set}"
 VOICE="${VOICE:-voices/default.wav}"
 
@@ -11,13 +11,41 @@ curl -sf "$API/healthz" | jq .
 echo "==> /status (authenticated)"
 curl -sf "$API/status" -H "authorization: Bearer $KEY" | jq .
 
-echo "==> /v1/audio/speech (first request)"
+echo "==> /v1/models"
+curl -sf "$API/v1/models" -H "authorization: Bearer $KEY" | jq .
+
+echo "==> /v1/audio/models"
+curl -sf "$API/v1/audio/models" -H "authorization: Bearer $KEY" | jq .
+
+echo "==> /v1/audio/voices"
+curl -sf "$API/v1/audio/voices" -H "authorization: Bearer $KEY" | jq .
+
+echo "==> /v1/audio/speech (default MP3 / Open WebUI path)"
 curl -sf -X POST "$API/v1/audio/speech" \
   -H "content-type: application/json" \
   -H "authorization: Bearer $KEY" \
   -d '{
-    "input": "Hi there, this is Chatterbox Turbo running behind the production-hardened FastAPI server.",
-    "voice": "default",
+    "input": "Hi there, this is Chatterbox Turbo running behind the lazy loaded Celery server.",
+    "voice": "alloy",
+    "model": "tts-1",
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "top_k": 1000,
+    "repetition_penalty": 1.2
+  }' \
+  --output speech.mp3 \
+  -D - | grep -E "x-voice-cached|x-rtf|x-wall|x-output-format"
+
+file speech.mp3
+
+echo "==> /v1/audio/speech (explicit WAV)"
+curl -sf -X POST "$API/v1/audio/speech" \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $KEY" \
+  -d '{
+    "input": "Return an explicit WAV please.",
+    "voice": "alloy",
+    "model": "tts-1",
     "temperature": 0.8,
     "top_p": 0.95,
     "top_k": 1000,
@@ -25,7 +53,7 @@ curl -sf -X POST "$API/v1/audio/speech" \
     "response_format": "wav"
   }' \
   --output speech.wav \
-  -D - | grep -E "x-voice-cached|x-rtf|x-wall"
+  -D - | grep -E "x-voice-cached|x-rtf|x-wall|x-output-format"
 
 file speech.wav
 

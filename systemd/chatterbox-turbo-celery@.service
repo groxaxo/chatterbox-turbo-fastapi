@@ -1,0 +1,22 @@
+[Unit]
+Description=Chatterbox Turbo Celery worker on GPU %i
+After=network-online.target
+Wants=network-online.target
+PartOf=chatterbox-turbo.target
+
+[Service]
+Type=simple
+User=op
+Group=op
+WorkingDirectory=/home/op/chatterbox-turbo-fastapi
+EnvironmentFile=-/etc/chatterbox-turbo-fastapi.env
+Environment=GPU_PHYSICAL_INDEX=%i
+ExecStart=/bin/bash /home/op/chatterbox-turbo-fastapi/run_celery_worker.sh %i
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

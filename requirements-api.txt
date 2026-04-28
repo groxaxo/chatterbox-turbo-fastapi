@@ -5,4 +5,6 @@ pydantic==2.10.5
 soundfile==0.12.1
 numpy>=1.24.0,<2.0.0
 anyio>=4.0.0
+celery[redis]>=5.4.0,<6.0.0
+redis>=5.2.1,<6.0.0
 chatterbox-tts==0.1.7
