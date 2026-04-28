@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import random
+import secrets
 import tempfile
 import threading
 import time
@@ -39,6 +40,8 @@ DEVICE = os.getenv("DEVICE", "cuda")
 REQUIRE_CUDA = os.getenv("REQUIRE_CUDA", "1") == "1"
 
 API_KEY = os.getenv("API_KEY", "").strip()
+ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
+_PLACEHOLDER_API_KEYS = {"", "change-this-key"}
 
 VOICE_DIR = Path(os.getenv("VOICE_DIR", "./voices")).resolve()
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "").strip()
@@ -77,13 +80,20 @@ voice_digest_cache: "OrderedDict[str, tuple[tuple[int, int, int, int], str]]" = 
 # -----------------------------
 
 async def require_api_key(request: Request) -> None:
-    if not API_KEY:
+    if ALLOW_NO_AUTH:
         return
 
+    if API_KEY in _PLACEHOLDER_API_KEYS:
+        raise HTTPException(
+            status_code=503,
+            detail="Server API key is not configured. Set API_KEY or use ALLOW_NO_AUTH=1 for local-only dev.",
+        )
+
     auth = request.headers.get("authorization", "")
+    bearer = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
     x_api_key = request.headers.get("x-api-key", "")
 
-    if auth == f"Bearer {API_KEY}" or x_api_key == API_KEY:
+    if secrets.compare_digest(bearer, API_KEY) or secrets.compare_digest(x_api_key, API_KEY):
         return
 
     raise HTTPException(status_code=401, detail="Invalid or missing API key")
@@ -175,8 +185,9 @@ def normalize_voice_path(voice: Optional[str]) -> Optional[Path]:
             raise HTTPException(status_code=400, detail="Absolute voice paths are disabled.")
         p = Path(raw).resolve()
     else:
-        # Only plain filenames are accepted; reject anything with a directory separator.
-        if "/" in raw or os.sep in raw:
+        # Reject anything containing a directory separator (all platforms).
+        bad_seps = {"/", "\\", os.sep, os.altsep}
+        if any(sep and sep in raw for sep in bad_seps):
             raise HTTPException(status_code=400, detail="Voice name must be a plain filename, not a path.")
         p = (VOICE_DIR / raw).resolve()
         # Belt-and-suspenders: ensure the resolved path stays inside VOICE_DIR.
@@ -498,8 +509,15 @@ async def run_generation(
 # Routes
 # -----------------------------
 
-@app.get("/health")
-def health() -> dict[str, Any]:
+@app.get("/healthz")
+def healthz() -> dict[str, Any]:
+    """Minimal liveness probe — safe to expose without authentication."""
+    return {"ok": model is not None}
+
+
+@app.get("/status", dependencies=[Depends(require_api_key)])
+def status() -> dict[str, Any]:
+    """Detailed runtime status — requires authentication."""
     gpu = None
 
     if torch.cuda.is_available():
@@ -525,6 +543,12 @@ def health() -> dict[str, Any]:
         "voice_cache_entries": len(conditionals_cache),
         "voice_cache_size": VOICE_CACHE_SIZE,
     }
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    """Backwards-compatible alias for /healthz."""
+    return healthz()
 
 
 @app.get("/voices", dependencies=[Depends(require_api_key)])
@@ -581,8 +605,9 @@ async def tts_multipart(
 
     except HTTPException:
         raise
-    except AssertionError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except AssertionError:
+        logger.exception("TTS assertion failed (multipart)")
+        raise HTTPException(status_code=400, detail="Invalid TTS request.")
     except Exception as e:
         logger.exception("TTS generation failed (multipart)")
         raise HTTPException(status_code=500, detail="TTS failed. Check server logs.")
@@ -631,8 +656,9 @@ async def openai_style_speech(req: SpeechRequest):
 
     except HTTPException:
         raise
-    except AssertionError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except AssertionError:
+        logger.exception("TTS assertion failed (OpenAI speech endpoint)")
+        raise HTTPException(status_code=400, detail="Invalid TTS request.")
     except Exception as e:
         logger.exception("TTS generation failed (OpenAI speech endpoint)")
         raise HTTPException(status_code=500, detail="TTS failed. Check server logs.")
