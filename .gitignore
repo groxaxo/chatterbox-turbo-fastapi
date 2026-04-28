@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+*.env
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime artefacts
+server.log
+speech.wav
+*.log
+
+# Voice files (can be large; user-provided)
+voices/
+
+# Model weights
+*.gguf
+*.pt
+*.safetensors
+
+# Temp uploads
+/tmp/
