@@ -31,13 +31,8 @@ mkdir -p voices
 cp /path/to/reference.wav voices/default.wav
 
 # Production — API on :7766, Celery-backed, Open WebUI-compatible MP3 default:
-API_KEY="$(openssl rand -hex 32)" ./run_api_service.sh
-
-# Local dev only — skip authentication:
-ALLOW_NO_AUTH=1 ./run_api_service.sh
+./run_api_service.sh
 ```
-
-`API_KEY` is **required** unless `ALLOW_NO_AUTH=1` is set. The server refuses to start with a missing key.
 
 To run a worker manually on a specific physical 3060:
 
@@ -72,18 +67,14 @@ The generated env file defaults to port `7766`, queue `chatterbox_tts`, `alloy`/
 |---|---|---|
 | `GET /healthz` | ✗ | Liveness probe |
 | `GET /health` | ✗ | Alias for `/healthz` |
-| `GET /status` | ✓ | Runtime status (backend mode, chunking, worker GPU policy) |
-| `GET /voices` | ✓ | Voice aliases + local voice files |
-| `GET /v1/models` | ✓ | OpenAI-style model list |
-| `GET /v1/audio/models` | ✓ | Open WebUI custom TTS model discovery |
-| `GET /v1/audio/voices` | ✓ | Open WebUI custom TTS voice discovery |
-| `POST /v1/audio/speech` | ✓ | OpenAI-compatible speech synthesis (`mp3` default, `wav` supported) |
-| `POST /tts` | ✓ | Multipart speech synthesis (with voice upload) |
-| `POST /warmup` | ✓ | Force a warmup inference pass |
-
-## Authentication
-
-Pass the key as `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+| `GET /status` | ✗ | Runtime status (backend mode, chunking, worker GPU policy) |
+| `GET /voices` | ✗ | Voice aliases + local voice files |
+| `GET /v1/models` | ✗ | OpenAI-style model list |
+| `GET /v1/audio/models` | ✗ | Open WebUI custom TTS model discovery |
+| `GET /v1/audio/voices` | ✗ | Open WebUI custom TTS voice discovery |
+| `POST /v1/audio/speech` | ✗ | OpenAI-compatible speech synthesis (`mp3` default, `wav` supported) |
+| `POST /tts` | ✗ | Multipart speech synthesis (with voice upload) |
+| `POST /warmup` | ✗ | Force a warmup inference pass |
 
 ## Open WebUI
 
@@ -91,7 +82,7 @@ Use these settings in **Settings -> Audio**:
 
 - **TTS Engine:** `OpenAI`
 - **OpenAI Base URL:** `http://127.0.0.1:7766/v1`
-- **OpenAI API Key:** the value from `/etc/chatterbox-turbo-fastapi.env`
+- **OpenAI API Key:** any value (ignored)
 - **TTS Model:** `tts-1`
 - **TTS Voice:** `alloy`
 
@@ -129,7 +120,6 @@ Chunk-target sweep on the long prompt:
 ## Test
 
 ```bash
-export API_KEY="your-key-here"
 ./test_curl.sh
 ```
 

@@ -6,7 +6,6 @@ import logging
 import os
 import random
 import re
-import secrets
 import subprocess
 import tempfile
 import threading
@@ -42,10 +41,6 @@ logger = logging.getLogger("chatterbox_api")
 DEVICE = os.getenv("DEVICE", "cuda")
 REQUIRE_CUDA = os.getenv("REQUIRE_CUDA", "1") == "1"
 EXPECTED_GPU_NAME = os.getenv("EXPECTED_GPU_NAME", "").strip()
-
-API_KEY = os.getenv("API_KEY", "").strip()
-ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
-_PLACEHOLDER_API_KEYS = {"", "change-this-key"}
 
 VOICE_DIR = Path(os.getenv("VOICE_DIR", "./voices")).resolve()
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "").strip()
@@ -110,23 +105,7 @@ idle_monitor_started = False
 # -----------------------------
 
 async def require_api_key(request: Request) -> None:
-    if ALLOW_NO_AUTH:
-        return
-
-    if API_KEY in _PLACEHOLDER_API_KEYS:
-        raise HTTPException(
-            status_code=503,
-            detail="Server API key is not configured. Set API_KEY or use ALLOW_NO_AUTH=1 for local-only dev.",
-        )
-
-    auth = request.headers.get("authorization", "")
-    bearer = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-    x_api_key = request.headers.get("x-api-key", "")
-
-    if secrets.compare_digest(bearer, API_KEY) or secrets.compare_digest(x_api_key, API_KEY):
-        return
-
-    raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return
 
 
 # -----------------------------
@@ -943,9 +922,6 @@ def wait_for_celery_chunks_parallel(
 async def lifespan(app: FastAPI):
     ensure_dirs()
     ensure_idle_monitor_started()
-
-    if not ALLOW_NO_AUTH and API_KEY in _PLACEHOLDER_API_KEYS:
-        logger.warning("API_KEY is unset. Authenticated endpoints will return 503 until configured.")
 
     if not LAZY_LOAD_MODEL and not ENABLE_CELERY:
         with model_lock:

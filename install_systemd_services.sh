@@ -12,14 +12,12 @@ install -Dm644 systemd/chatterbox-turbo-celery@.service /etc/systemd/system/chat
 install -Dm644 systemd/chatterbox-turbo.target /etc/systemd/system/chatterbox-turbo.target
 
 if [[ ! -f /etc/chatterbox-turbo-fastapi.env ]]; then
-  API_KEY_VALUE="$(openssl rand -hex 32)"
   DEFAULT_VOICE_VALUE="/home/op/chatterbox-turbo-fastapi/voices/default.wav"
   if [[ -f /home/op/Libro-Gregoria-Variacion/audio/britishWoman_clean.wav ]]; then
     DEFAULT_VOICE_VALUE="/home/op/Libro-Gregoria-Variacion/audio/britishWoman_clean.wav"
   fi
   cat >/etc/chatterbox-turbo-fastapi.env <<EOF
-API_KEY=${API_KEY_VALUE}
-ALLOW_NO_AUTH=0
+ALLOW_NO_AUTH=1
 PORT=7766
 VOICE_DIR=/home/op/chatterbox-turbo-fastapi/voices
 DEFAULT_VOICE=${DEFAULT_VOICE_VALUE}

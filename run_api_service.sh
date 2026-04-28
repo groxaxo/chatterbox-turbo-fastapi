@@ -6,13 +6,7 @@ cd "$(dirname "$0")"
 PY_ENV_PREFIX="${PY_ENV_PREFIX:-/home/op/miniconda3/envs/chatterbox-turbo-api/bin}"
 UVICORN_BIN="${UVICORN_BIN:-$PY_ENV_PREFIX/uvicorn}"
 
-export ALLOW_NO_AUTH="${ALLOW_NO_AUTH:-0}"
-if [[ "$ALLOW_NO_AUTH" != "1" && -z "${API_KEY:-}" ]]; then
-  echo "ERROR: API_KEY is required." >&2
-  echo "  Set a strong key:  API_KEY=\"\$(openssl rand -hex 32)\" ./run_api_service.sh" >&2
-  echo "  Local dev only:    ALLOW_NO_AUTH=1 ./run_api_service.sh" >&2
-  exit 1
-fi
+export ALLOW_NO_AUTH=1
 
 BRITISH_WOMAN_REF="/home/op/Libro-Gregoria-Variacion/audio/britishWoman_clean.wav"
 DEFAULT_FALLBACK="$PWD/voices/default.wav"

@@ -2,28 +2,26 @@
 set -euo pipefail
 
 API="${API:-http://127.0.0.1:7766}"
-KEY="${API_KEY:?API_KEY must be set}"
 VOICE="${VOICE:-voices/default.wav}"
 
 echo "==> /healthz (no auth)"
 curl -sf "$API/healthz" | jq .
 
-echo "==> /status (authenticated)"
-curl -sf "$API/status" -H "authorization: Bearer $KEY" | jq .
+echo "==> /status"
+curl -sf "$API/status" | jq .
 
 echo "==> /v1/models"
-curl -sf "$API/v1/models" -H "authorization: Bearer $KEY" | jq .
+curl -sf "$API/v1/models" | jq .
 
 echo "==> /v1/audio/models"
-curl -sf "$API/v1/audio/models" -H "authorization: Bearer $KEY" | jq .
+curl -sf "$API/v1/audio/models" | jq .
 
 echo "==> /v1/audio/voices"
-curl -sf "$API/v1/audio/voices" -H "authorization: Bearer $KEY" | jq .
+curl -sf "$API/v1/audio/voices" | jq .
 
 echo "==> /v1/audio/speech (default MP3 / Open WebUI path)"
 curl -sf -X POST "$API/v1/audio/speech" \
   -H "content-type: application/json" \
-  -H "authorization: Bearer $KEY" \
   -d '{
     "input": "Hi there, this is Chatterbox Turbo running behind the lazy loaded Celery server.",
     "voice": "alloy",
@@ -41,7 +39,6 @@ file speech.mp3
 echo "==> /v1/audio/speech (explicit WAV)"
 curl -sf -X POST "$API/v1/audio/speech" \
   -H "content-type: application/json" \
-  -H "authorization: Bearer $KEY" \
   -d '{
     "input": "Return an explicit WAV please.",
     "voice": "alloy",
@@ -59,7 +56,6 @@ file speech.wav
 
 echo "==> Path traversal must return 400"
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/v1/audio/speech" \
-  -H "authorization: Bearer $KEY" \
   -H "content-type: application/json" \
   -d '{"input":"test","voice":"../secret.wav"}')
 [[ "$STATUS" == "400" ]] && echo "PASS (got 400)" || { echo "FAIL (got $STATUS)"; exit 1; }
