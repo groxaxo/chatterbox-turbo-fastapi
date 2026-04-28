@@ -70,8 +70,11 @@ The generated env file defaults to port `7766`, queue `chatterbox_tts`, `alloy`/
 | `GET /status` | ✗ | Runtime status (backend mode, chunking, worker GPU policy) |
 | `GET /voices` | ✗ | Voice aliases + local voice files |
 | `GET /v1/models` | ✗ | OpenAI-style model list |
+| `GET /audio/models` | ✗ | Open WebUI custom TTS model discovery |
 | `GET /v1/audio/models` | ✗ | Open WebUI custom TTS model discovery |
+| `GET /audio/voices` | ✗ | Open WebUI custom TTS voice discovery |
 | `GET /v1/audio/voices` | ✗ | Open WebUI custom TTS voice discovery |
+| `POST /audio/speech` | ✗ | Open WebUI-compatible speech synthesis (`mp3` default, `wav` supported) |
 | `POST /v1/audio/speech` | ✗ | OpenAI-compatible speech synthesis (`mp3` default, `wav` supported) |
 | `POST /tts` | ✗ | Multipart speech synthesis (with voice upload) |
 | `POST /warmup` | ✗ | Force a warmup inference pass |
@@ -81,12 +84,12 @@ The generated env file defaults to port `7766`, queue `chatterbox_tts`, `alloy`/
 Use these settings in **Settings -> Audio**:
 
 - **TTS Engine:** `OpenAI`
-- **OpenAI Base URL:** `http://127.0.0.1:7766/v1`
+- **OpenAI Base URL:** `http://127.0.0.1:7766` or `http://127.0.0.1:7766/v1`
 - **OpenAI API Key:** any value (ignored)
 - **TTS Model:** `tts-1`
 - **TTS Voice:** `alloy`
 
-The server exposes the extra `/v1/audio/models` and `/v1/audio/voices` endpoints that Open WebUI uses for custom TTS providers.
+The server exposes both `/audio/*` and `/v1/audio/*` routes, so it works whether the configured base URL includes `/v1` or not.
 
 For local STT correlation, the matching OpenAI-compatible Parakeet endpoint is:
 

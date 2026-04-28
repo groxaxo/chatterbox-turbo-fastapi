@@ -848,7 +848,7 @@ def wait_for_celery_result(task) -> tuple[bytes, dict[str, Any]]:
 
 def wait_for_celery_chunks_parallel(
     tasks: list,
-) -> list[tuple[np.ndarray, int]]:
+) -> list[tuple[np.ndarray, int, bool]]:
     """
     Wait for all chunk tasks in parallel.  Returns a list of (array, sample_rate)
     tuples in original chunk order.
@@ -895,7 +895,7 @@ def wait_for_celery_chunks_parallel(
             raise HTTPException(status_code=500, detail=f"Chunk {i} synthesis failed: {err}")
 
     # Decode results in order and verify sample-rate consistency
-    results: list[tuple[np.ndarray, int]] = []
+    results: list[tuple[np.ndarray, int, bool]] = []
     expected_sr: Optional[int] = None
     for i in range(n):
         payload = tasks[i].result
@@ -909,7 +909,8 @@ def wait_for_celery_chunks_parallel(
             expected_sr = sr
         elif sr != expected_sr:
             logger.warning("Sample-rate mismatch across chunks: %d vs %d — resampling ignored.", sr, expected_sr)
-        results.append((arr, sr))
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        results.append((arr, sr, bool(metadata.get("voice_cached", False))))
 
     return results
 
@@ -1019,6 +1020,8 @@ async def run_generation(
 
         # Multiple chunks — dispatch all in parallel, stitch on the API server
         logger.info("Parallel dispatch: %d chunks for %d chars", chunk_count, len(text))
+        t_start = time.monotonic()
+
         tasks = [
             celery_app.send_task(
                 "chatterbox_turbo.synthesize_chunk",
@@ -1028,15 +1031,14 @@ async def run_generation(
             for chunk in chunks
         ]
 
-        chunk_results: list[tuple[np.ndarray, int]] = await anyio.to_thread.run_sync(
+        chunk_results: list[tuple[np.ndarray, int, bool]] = await anyio.to_thread.run_sync(
             lambda: wait_for_celery_chunks_parallel(tasks), abandon_on_cancel=False
         )
 
-        t_start = time.monotonic()
-
         # Stitch chunks with a short silence between each
         sample_rate = chunk_results[0][1]
-        arrays = [arr for arr, _sr in chunk_results]
+        arrays = [arr for arr, _sr, _voice_cached in chunk_results]
+        voice_cache_hits = [voice_cached for _arr, _sr, voice_cached in chunk_results]
         stitched = concatenate_audio_arrays(arrays, sample_rate)
 
         audio_seconds = round(len(stitched) / sample_rate, 4)
@@ -1045,8 +1047,11 @@ async def run_generation(
         content_type = "audio/mpeg" if output_format == "mp3" else "audio/wav"
 
         if output_format == "mp3":
-            wav_tmp = wav_bytes_from_array(stitched, sample_rate)
-            final_bytes = encode_audio_bytes(wav_tmp, "mp3")
+            final_bytes, content_type, extension = encode_audio_bytes(
+                stitched,
+                sample_rate,
+                "mp3",
+            )
         elif output_format == "json_base64":
             wav_bytes_out = wav_bytes_from_array(stitched, sample_rate)
             final_bytes = json.dumps(
@@ -1060,7 +1065,7 @@ async def run_generation(
         meta = {
             "chunk_count": chunk_count,
             "sample_rate": sample_rate,
-            "voice_cached": False,
+            "voice_cached": any(voice_cache_hits),
             "cache_entries": len(conditionals_cache),
             "wall_seconds": wall_seconds,
             "audio_seconds": audio_seconds,
@@ -1200,6 +1205,7 @@ async def tts_multipart(
             uploaded_path.unlink(missing_ok=True)
 
 
+@app.post("/audio/speech", dependencies=[Depends(require_api_key)])
 @app.post("/v1/audio/speech", dependencies=[Depends(require_api_key)])
 async def openai_style_speech(req: SpeechRequest):
     validate_generation_args(
@@ -1238,7 +1244,7 @@ async def openai_style_speech(req: SpeechRequest):
             return JSONResponse(
                 {
                     "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
-                    "content_type": "audio/wav",
+                    "content_type": meta["content_type"],
                     "metadata": meta,
                 }
             )
