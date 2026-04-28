@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import io
+import json
 import logging
 import os
 import random
@@ -58,6 +59,8 @@ VOICE_CACHE_SIZE = int(os.getenv("VOICE_CACHE_SIZE", "8"))
 AUTO_CHUNK_ENABLED = os.getenv("AUTO_CHUNK_ENABLED", "1") == "1"
 AUTO_CHUNK_TARGET_CHARS = int(os.getenv("AUTO_CHUNK_TARGET_CHARS", str(MAX_TEXT_CHARS)))
 AUTO_CHUNK_HARD_LIMIT = int(os.getenv("AUTO_CHUNK_HARD_LIMIT", str(max(MAX_TEXT_CHARS, 420))))
+# Sentences shorter than this are merged forward rather than emitted as standalone chunks
+MIN_CHUNK_CHARS = int(os.getenv("MIN_CHUNK_CHARS", "60"))
 CHUNK_PAUSE_MS = int(os.getenv("CHUNK_PAUSE_MS", "140"))
 DEFAULT_RESPONSE_FORMAT = os.getenv("DEFAULT_RESPONSE_FORMAT", "mp3").strip().lower()
 
@@ -511,35 +514,68 @@ def split_oversized_unit(text: str, hard_limit: int) -> list[str]:
 
 
 def chunk_text_for_tts(text: str) -> list[str]:
+    """
+    Split text into synthesis chunks at sentence boundaries (. ! ? and newlines).
+
+    Strategy:
+    - Every sentence ending is a natural chunk boundary.
+    - Sentences shorter than MIN_CHUNK_CHARS are merged forward with the next sentence
+      so we avoid submitting very short standalone clips.
+    - Sentences longer than AUTO_CHUNK_HARD_LIMIT are sub-split via split_oversized_unit.
+    - A backward-merge post-pass ensures a short trailing chunk is folded into the
+      previous chunk rather than being emitted as a tiny standalone clip.
+
+    With Celery, each chunk is dispatched as a separate task so they run in parallel
+    across available GPU workers.
+    """
     cleaned = re.sub(r"[ \t]+", " ", text.strip())
     if not cleaned:
         return []
 
-    if not AUTO_CHUNK_ENABLED or len(cleaned) <= AUTO_CHUNK_HARD_LIMIT:
+    if not AUTO_CHUNK_ENABLED:
         return [cleaned]
 
-    units = [u.strip() for u in re.split(r"(?<=[.!?])\s+|\n+", cleaned) if u.strip()]
-    if not units:
+    # Split on sentence-ending punctuation or paragraph breaks
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", cleaned) if s.strip()]
+    if not raw_sentences:
         return [cleaned]
 
+    # Sub-split any sentence that exceeds the hard limit
+    units: list[str] = []
+    for sentence in raw_sentences:
+        if len(sentence) > AUTO_CHUNK_HARD_LIMIT:
+            units.extend(split_oversized_unit(sentence, AUTO_CHUNK_HARD_LIMIT))
+        else:
+            units.append(sentence)
+
+    # Emit one chunk per sentence; merge short leading fragments forward
     chunks: list[str] = []
     current = ""
-
     for unit in units:
-        for fragment in split_oversized_unit(unit, AUTO_CHUNK_HARD_LIMIT):
-            candidate = fragment if not current else f"{current} {fragment}"
-            if current and len(candidate) > AUTO_CHUNK_HARD_LIMIT:
-                chunks.append(current)
-                current = fragment
-            else:
-                current = candidate
-
-            if len(current) >= AUTO_CHUNK_TARGET_CHARS:
-                chunks.append(current)
-                current = ""
-
+        if not current:
+            current = unit
+            continue
+        merged = f"{current} {unit}"
+        if len(merged) > AUTO_CHUNK_HARD_LIMIT:
+            # Merging would overflow — emit current, start fresh
+            chunks.append(current)
+            current = unit
+        elif len(current) < MIN_CHUNK_CHARS:
+            # Too short to stand alone — merge with next
+            current = merged
+        else:
+            # Long enough to be its own chunk
+            chunks.append(current)
+            current = unit
     if current:
         chunks.append(current)
+
+    # Backward-merge pass: fold a short trailing chunk into the previous one
+    if len(chunks) >= 2 and len(chunks[-1]) < MIN_CHUNK_CHARS:
+        merged = f"{chunks[-2]} {chunks[-1]}"
+        if len(merged) <= AUTO_CHUNK_HARD_LIMIT:
+            chunks[-2] = merged
+            chunks.pop()
 
     return chunks
 
@@ -691,6 +727,33 @@ def synthesize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def synthesize_single_chunk_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Synthesize a single pre-split text chunk.  No further chunking is applied.
+    Always returns lossless WAV as base64 so the API server can stitch chunks
+    before encoding to the client-requested format.
+    """
+    voice_path = Path(payload["voice_path"]).resolve() if payload.get("voice_path") else None
+    arr, sample_rate, voice_cache_hit = generate_chunk_locked(
+        text=payload["text"],
+        voice_path=voice_path,
+        temperature=float(payload["temperature"]),
+        top_p=float(payload["top_p"]),
+        top_k=int(payload["top_k"]),
+        repetition_penalty=float(payload["repetition_penalty"]),
+        norm_loudness=bool(payload["norm_loudness"]),
+        seed=int(payload["seed"]),
+    )
+    wav_bytes = wav_bytes_from_array(arr, sample_rate)
+    return {
+        "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
+        "metadata": {
+            "sample_rate": sample_rate,
+            "voice_cached": voice_cache_hit,
+        },
+    }
+
+
 def response_with_audio(audio_bytes: bytes, meta: dict[str, Any]) -> Response:
     headers: dict[str, str] = {
         "Content-Disposition": f'attachment; filename="{meta["filename"]}"',
@@ -804,6 +867,74 @@ def wait_for_celery_result(task) -> tuple[bytes, dict[str, Any]]:
     return base64.b64decode(audio_base64), payload["metadata"]
 
 
+def wait_for_celery_chunks_parallel(
+    tasks: list,
+) -> list[tuple[np.ndarray, int]]:
+    """
+    Wait for all chunk tasks in parallel.  Returns a list of (array, sample_rate)
+    tuples in original chunk order.
+
+    Fail-fast: on any single task failure or timeout the remaining tasks are
+    revoked and an HTTPException is raised.
+    """
+    deadline = time.monotonic() + CELERY_TASK_TIMEOUT_SECONDS
+    n = len(tasks)
+    done: dict[int, Any] = {}
+
+    while time.monotonic() < deadline:
+        pending = [i for i in range(n) if i not in done]
+        if not pending:
+            break
+        for i in pending:
+            if tasks[i].ready():
+                done[i] = tasks[i]
+        if len(done) < n:
+            time.sleep(0.05)
+    else:
+        # Timeout — revoke remaining tasks
+        for i in range(n):
+            if i not in done:
+                try:
+                    tasks[i].revoke(terminate=True)
+                except Exception:
+                    pass
+        raise HTTPException(
+            status_code=504,
+            detail=f"Timed out waiting for {n - len(done)}/{n} Celery chunk tasks.",
+        )
+
+    # Check for failures
+    for i in range(n):
+        if tasks[i].failed():
+            err = str(tasks[i].result)
+            for j in range(n):
+                if j != i:
+                    try:
+                        tasks[j].revoke(terminate=True)
+                    except Exception:
+                        pass
+            raise HTTPException(status_code=500, detail=f"Chunk {i} synthesis failed: {err}")
+
+    # Decode results in order and verify sample-rate consistency
+    results: list[tuple[np.ndarray, int]] = []
+    expected_sr: Optional[int] = None
+    for i in range(n):
+        payload = tasks[i].result
+        if not isinstance(payload, dict) or not payload.get("audio_base64"):
+            raise HTTPException(status_code=500, detail=f"Chunk {i} returned an empty payload.")
+        wav_bytes = base64.b64decode(payload["audio_base64"])
+        arr, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+        if arr.ndim > 1:
+            arr = arr[:, 0]
+        if expected_sr is None:
+            expected_sr = sr
+        elif sr != expected_sr:
+            logger.warning("Sample-rate mismatch across chunks: %d vs %d — resampling ignored.", sr, expected_sr)
+        results.append((arr, sr))
+
+    return results
+
+
 # -----------------------------
 # Lifespan
 # -----------------------------
@@ -882,8 +1013,13 @@ async def run_generation(
     if ENABLE_CELERY:
         from celery_worker import celery_app
 
-        payload = {
-            "text": text,
+        chunks = chunk_text_for_tts(text)
+        chunk_count = len(chunks)
+
+        if chunk_count == 0:
+            raise HTTPException(status_code=400, detail="No text to synthesize after cleaning.")
+
+        base_payload = {
             "voice_path": str(voice_path) if voice_path else None,
             "temperature": temperature,
             "top_p": top_p,
@@ -891,10 +1027,76 @@ async def run_generation(
             "repetition_penalty": repetition_penalty,
             "norm_loudness": norm_loudness,
             "seed": seed,
-            "output_format": output_format,
         }
-        task = celery_app.send_task("chatterbox_turbo.synthesize", kwargs={"payload": payload}, queue=CELERY_QUEUE)
-        return await anyio.to_thread.run_sync(lambda: wait_for_celery_result(task), abandon_on_cancel=False)
+
+        if chunk_count == 1:
+            # Single chunk — use the original task so the worker handles format encoding
+            payload = {**base_payload, "text": chunks[0], "output_format": output_format}
+            task = celery_app.send_task(
+                "chatterbox_turbo.synthesize",
+                kwargs={"payload": payload},
+                queue=CELERY_QUEUE,
+            )
+            return await anyio.to_thread.run_sync(
+                lambda: wait_for_celery_result(task), abandon_on_cancel=False
+            )
+
+        # Multiple chunks — dispatch all in parallel, stitch on the API server
+        logger.info("Parallel dispatch: %d chunks for %d chars", chunk_count, len(text))
+        tasks = [
+            celery_app.send_task(
+                "chatterbox_turbo.synthesize_chunk",
+                kwargs={"payload": {**base_payload, "text": chunk}},
+                queue=CELERY_QUEUE,
+            )
+            for chunk in chunks
+        ]
+
+        chunk_results: list[tuple[np.ndarray, int]] = await anyio.to_thread.run_sync(
+            lambda: wait_for_celery_chunks_parallel(tasks), abandon_on_cancel=False
+        )
+
+        t_start = time.monotonic()
+
+        # Stitch chunks with a short silence between each
+        sample_rate = chunk_results[0][1]
+        arrays = [arr for arr, _sr in chunk_results]
+        stitched = concatenate_audio_arrays(arrays, sample_rate)
+
+        audio_seconds = round(len(stitched) / sample_rate, 4)
+        wall_seconds = round(time.monotonic() - t_start, 4)
+        extension = "mp3" if output_format == "mp3" else "wav"
+        content_type = "audio/mpeg" if output_format == "mp3" else "audio/wav"
+
+        if output_format == "mp3":
+            wav_tmp = wav_bytes_from_array(stitched, sample_rate)
+            final_bytes = encode_audio_bytes(wav_tmp, "mp3")
+        elif output_format == "json_base64":
+            wav_bytes_out = wav_bytes_from_array(stitched, sample_rate)
+            final_bytes = json.dumps(
+                {"audio_base64": base64.b64encode(wav_bytes_out).decode("ascii")}
+            ).encode()
+            extension = "json"
+            content_type = "application/json"
+        else:
+            final_bytes = wav_bytes_from_array(stitched, sample_rate)
+
+        meta = {
+            "chunk_count": chunk_count,
+            "sample_rate": sample_rate,
+            "voice_cached": False,
+            "cache_entries": len(conditionals_cache),
+            "wall_seconds": wall_seconds,
+            "audio_seconds": audio_seconds,
+            "rtf": round(wall_seconds / audio_seconds, 4) if audio_seconds > 0 else None,
+            "x_realtime": round(audio_seconds / wall_seconds, 4) if wall_seconds > 0 else None,
+            "chunk_target_chars": AUTO_CHUNK_TARGET_CHARS,
+            "output_format": output_format,
+            "content_type": content_type,
+            "filename": f"speech.{extension}",
+        }
+
+        return final_bytes, meta
 
     return await anyio.to_thread.run_sync(
         lambda: synthesize_request_sync(
