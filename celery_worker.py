@@ -1,6 +1,6 @@
 import os
 
-from celery import Celery
+from celery import Celery, signals
 
 from server import (
     CELERY_BROKER_URL,
@@ -8,7 +8,9 @@ from server import (
     CELERY_RESULT_BACKEND,
     logger,
     synthesize_payload,
+    synthesize_chunk_batch_payload,
     synthesize_single_chunk_payload,
+    warm_worker_model_if_needed,
 )
 
 celery_app = Celery(
@@ -29,6 +31,14 @@ celery_app.conf.update(
 )
 
 
+@signals.worker_ready.connect
+def preload_worker_model(**_: object) -> None:
+    try:
+        warm_worker_model_if_needed()
+    except Exception:
+        logger.exception("Worker preload failed")
+
+
 @celery_app.task(name="chatterbox_turbo.synthesize")
 def synthesize(payload: dict[str, object]) -> dict[str, object]:
     logger.info(
@@ -42,7 +52,7 @@ def synthesize(payload: dict[str, object]) -> dict[str, object]:
 @celery_app.task(name="chatterbox_turbo.synthesize_chunk")
 def synthesize_chunk(payload: dict[str, object]) -> dict[str, object]:
     """
-    Synthesize a single pre-split text chunk and return WAV as base64.
+    Synthesize a single pre-split text chunk and return PCM payload metadata.
     Called in parallel by the API server when a request contains multiple sentences.
     """
     logger.info(
@@ -52,3 +62,15 @@ def synthesize_chunk(payload: dict[str, object]) -> dict[str, object]:
         len(str(payload.get("text", ""))),
     )
     return synthesize_single_chunk_payload(payload)
+
+
+@celery_app.task(name="chatterbox_turbo.synthesize_chunk_batch")
+def synthesize_chunk_batch(payload: dict[str, object]) -> dict[str, object]:
+    items = payload.get("items", [])
+    logger.info(
+        "Celery chunk batch task received (queue=%s, hostname=%s, item_count=%d).",
+        CELERY_QUEUE,
+        os.uname().nodename,
+        len(items) if isinstance(items, list) else 0,
+    )
+    return synthesize_chunk_batch_payload(payload)

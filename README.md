@@ -14,6 +14,7 @@ This build is configured for:
 - **Default response format:** `mp3` (for Open WebUI compatibility)
 - **Auto chunking target:** `520` chars
 - **Auto chunking hard limit:** `580` chars
+- **Parallel chunk task cap:** defaults to the number of configured worker GPUs
 
 ## Install
 
@@ -60,6 +61,8 @@ Runtime config is stored in:
 ```
 
 The generated env file defaults to port `7766`, queue `chatterbox_tts`, `alloy`/British-woman reference voice, and the measured chunking target (`520/580`).
+
+Worker launches now default to keeping the GPU model resident and running a startup warmup pass. Override with `WORKER_LAZY_LOAD_MODEL`, `WORKER_MODEL_IDLE_UNLOAD_SECONDS`, or `WORKER_STARTUP_WARMUP` if you need the older lazy-unload behavior.
 
 ## API endpoints
 
@@ -131,4 +134,5 @@ Chunk-target sweep on the long prompt:
 - Use Python 3.11.
 - Keep the API process CPU-only when `ENABLE_CELERY=1`; only the Celery workers should see the 3060 GPUs.
 - The launcher defaults `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce long-run CUDA allocator fragmentation.
-- The service lazy-loads the model and unloads it again after the configured idle timeout.
+- The API process can still lazy-load, but the Celery GPU workers now default to a hot model plus startup warmup to avoid large first-request cold starts.
+- Multi-chunk requests are distributed across a bounded number of worker tasks instead of one Celery task per chunk.
