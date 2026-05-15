@@ -11,7 +11,8 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import OrderedDict
+import wave
+from collections import Counter, OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -45,6 +46,11 @@ EXPECTED_GPU_NAME = os.getenv("EXPECTED_GPU_NAME", "").strip()
 VOICE_DIR = Path(os.getenv("VOICE_DIR", "./voices")).resolve()
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "").strip()
 TMP_DIR = Path(os.getenv("TMP_DIR", tempfile.gettempdir())).resolve()
+DEFAULT_CHUNK_ARTIFACT_ROOT = Path("/dev/shm") if Path("/dev/shm").exists() else TMP_DIR
+CHUNK_ARTIFACT_DIR = Path(
+    os.getenv("CHUNK_ARTIFACT_DIR", str(DEFAULT_CHUNK_ARTIFACT_ROOT / "chatterbox_chunk_artifacts"))
+).resolve()
+CHUNK_ARTIFACT_TTL_SECONDS = int(os.getenv("CHUNK_ARTIFACT_TTL_SECONDS", "3600"))
 
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "12000"))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", os.getenv("MAX_CHUNK_CHARS", "360")))
@@ -62,8 +68,10 @@ DEFAULT_RESPONSE_FORMAT = os.getenv("DEFAULT_RESPONSE_FORMAT", "mp3").strip().lo
 WARMUP_TEXT = os.getenv("WARMUP_TEXT", "Warmup complete. [chuckle]")
 STARTUP_WARMUP = os.getenv("STARTUP_WARMUP", "0") == "1"
 LAZY_LOAD_MODEL = os.getenv("LAZY_LOAD_MODEL", "1") == "1"
-MODEL_IDLE_UNLOAD_SECONDS = int(os.getenv("MODEL_IDLE_UNLOAD_SECONDS", "900"))
+MODEL_IDLE_UNLOAD_SECONDS = int(os.getenv("MODEL_IDLE_UNLOAD_SECONDS", "300"))
 MODEL_IDLE_CHECK_INTERVAL_SECONDS = int(os.getenv("MODEL_IDLE_CHECK_INTERVAL_SECONDS", "30"))
+MIN_FREE_VRAM_MB = int(os.getenv("MIN_FREE_VRAM_MB", "3500"))
+MODEL_LOAD_WAIT_TIMEOUT_SECONDS = int(os.getenv("MODEL_LOAD_WAIT_TIMEOUT_SECONDS", "60"))
 
 ENABLE_CELERY = os.getenv("ENABLE_CELERY", "0") == "1"
 CELERY_TASK_TIMEOUT_SECONDS = int(os.getenv("CELERY_TASK_TIMEOUT_SECONDS", "300"))
@@ -86,6 +94,7 @@ WORKER_GPU_INDEX_LIST = [item.strip() for item in WORKER_GPU_INDICES.split(",") 
 MAX_CELERY_PARALLEL_TASKS = int(
     os.getenv("MAX_CELERY_PARALLEL_TASKS", str(max(1, len(WORKER_GPU_INDEX_LIST))))
 )
+CELERY_CHUNK_DISPATCH_MODE = os.getenv("CELERY_CHUNK_DISPATCH_MODE", "balanced_batches").strip().lower()
 
 
 # -----------------------------
@@ -120,6 +129,29 @@ async def require_api_key(request: Request) -> None:
 def ensure_dirs() -> None:
     VOICE_DIR.mkdir(parents=True, exist_ok=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
+    CHUNK_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_stale_chunk_artifacts() -> None:
+    if CHUNK_ARTIFACT_TTL_SECONDS <= 0:
+        return
+
+    ensure_dirs()
+    cutoff = time.time() - CHUNK_ARTIFACT_TTL_SECONDS
+    removed = 0
+
+    for path in CHUNK_ARTIFACT_DIR.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except FileNotFoundError:
+            continue
+
+    if removed:
+        logger.info("Removed %d stale chunk artifact(s).", removed)
 
 
 def configure_torch() -> str:
@@ -219,6 +251,26 @@ def ensure_idle_monitor_started() -> None:
     idle_monitor_started = True
 
 
+def wait_for_free_vram_if_needed() -> None:
+    if not DEVICE.startswith("cuda") or MIN_FREE_VRAM_MB <= 0 or not torch.cuda.is_available():
+        return
+    deadline = time.monotonic() + max(1, MODEL_LOAD_WAIT_TIMEOUT_SECONDS)
+    while True:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_mb = free_bytes / 1024**2
+        total_mb = total_bytes / 1024**2
+        if free_mb >= MIN_FREE_VRAM_MB:
+            logger.info("VRAM gate passed: %.0f MiB free / %.0f MiB total.", free_mb, total_mb)
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Not enough free VRAM to load Chatterbox Turbo: {free_mb:.0f} MiB free, "
+                f"need at least {MIN_FREE_VRAM_MB} MiB."
+            )
+        logger.info("Waiting for free VRAM: %.0f MiB free, need %d MiB.", free_mb, MIN_FREE_VRAM_MB)
+        time.sleep(5)
+
+
 def ensure_model_loaded_locked() -> ChatterboxTurboTTS:
     global model
 
@@ -227,6 +279,7 @@ def ensure_model_loaded_locked() -> ChatterboxTurboTTS:
         return model
 
     final_device = configure_torch()
+    wait_for_free_vram_if_needed()
     logger.info("Loading Chatterbox Turbo on %s...", final_device)
     model = ChatterboxTurboTTS.from_pretrained(device=final_device)
 
@@ -454,16 +507,23 @@ def tensor_to_float_array(wav: torch.Tensor | np.ndarray | list[float]) -> np.nd
 
 
 def wav_bytes_from_array(arr: np.ndarray, sample_rate: int) -> bytes:
-    buf = io.BytesIO()
-    sf.write(buf, arr, sample_rate, format="WAV", subtype="PCM_16")
-    buf.seek(0)
-    return buf.read()
+    return wav_bytes_from_pcm16_bytes(pcm16_bytes_from_array(arr), sample_rate)
 
 
 def pcm16_bytes_from_array(arr: np.ndarray) -> bytes:
     clipped = np.clip(arr.astype(np.float32, copy=False), -1.0, 1.0)
     pcm = np.rint(clipped * 32767.0).astype(np.int16, copy=False)
     return pcm.tobytes()
+
+
+def wav_bytes_from_pcm16_bytes(raw: bytes, sample_rate: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(raw)
+    return buf.getvalue()
 
 
 def float_array_from_pcm16_bytes(raw: bytes) -> np.ndarray:
@@ -474,12 +534,21 @@ def float_array_from_pcm16_bytes(raw: bytes) -> np.ndarray:
 
 
 def mp3_bytes_from_array(arr: np.ndarray, sample_rate: int) -> bytes:
-    wav_bytes = wav_bytes_from_array(arr, sample_rate)
+    return mp3_bytes_from_pcm16_bytes(pcm16_bytes_from_array(arr), sample_rate)
+
+
+def mp3_bytes_from_pcm16_bytes(raw: bytes, sample_rate: int) -> bytes:
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
+        "-f",
+        "s16le",
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        "1",
         "-i",
         "pipe:0",
         "-f",
@@ -491,7 +560,7 @@ def mp3_bytes_from_array(arr: np.ndarray, sample_rate: int) -> bytes:
         "pipe:1",
     ]
     try:
-        result = subprocess.run(cmd, input=wav_bytes, capture_output=True, check=True)
+        result = subprocess.run(cmd, input=raw, capture_output=True, check=True)
     except FileNotFoundError as exc:
         raise RuntimeError("ffmpeg is required for MP3 output but was not found on PATH.") from exc
     except subprocess.CalledProcessError as exc:
@@ -505,6 +574,21 @@ def encode_audio_bytes(arr: np.ndarray, sample_rate: int, output_format: str) ->
     if output_format == "mp3":
         return mp3_bytes_from_array(arr, sample_rate), "audio/mpeg", "mp3"
     raise RuntimeError(f"Unsupported output format: {output_format}")
+
+
+def encode_pcm16_bytes(raw: bytes, sample_rate: int, output_format: str) -> tuple[bytes, str, str]:
+    if output_format == "wav":
+        return wav_bytes_from_pcm16_bytes(raw, sample_rate), "audio/wav", "wav"
+    if output_format == "mp3":
+        return mp3_bytes_from_pcm16_bytes(raw, sample_rate), "audio/mpeg", "mp3"
+    raise RuntimeError(f"Unsupported output format: {output_format}")
+
+
+def write_chunk_artifact(raw: bytes) -> Path:
+    ensure_dirs()
+    out_path = CHUNK_ARTIFACT_DIR / f"chatterbox_chunk_{uuid.uuid4().hex}.pcm"
+    out_path.write_bytes(raw)
+    return out_path
 
 
 def split_oversized_unit(text: str, hard_limit: int) -> list[str]:
@@ -618,6 +702,12 @@ def build_chunk_task_specs(
     if not chunks:
         return []
 
+    if CELERY_CHUNK_DISPATCH_MODE in {"dynamic", "dynamic_chunks", "individual", "per_chunk"}:
+        return [
+            ("chatterbox_turbo.synthesize_chunk", {**base_payload, "text": chunk, "index": idx})
+            for idx, chunk in enumerate(chunks)
+        ]
+
     max_parallel = max(1, min(len(chunks), MAX_CELERY_PARALLEL_TASKS))
     if max_parallel >= len(chunks):
         return [
@@ -670,6 +760,25 @@ def concatenate_audio_arrays(chunks: list[np.ndarray], sample_rate: int) -> np.n
         merged.append(chunk.astype(np.float32, copy=False))
 
     return np.concatenate(merged) if len(merged) > 1 else merged[0]
+
+
+def concatenate_pcm16_chunks(chunks: list[bytes], sample_rate: int) -> tuple[bytes, int]:
+    if not chunks:
+        return b"", 0
+
+    pause_frames = max(0, int(sample_rate * (CHUNK_PAUSE_MS / 1000.0)))
+    silence = b"\x00\x00" * pause_frames
+    merged: list[bytes] = []
+    total_frames = 0
+
+    for idx, chunk in enumerate(chunks):
+        if idx > 0 and pause_frames > 0:
+            merged.append(silence)
+            total_frames += pause_frames
+        merged.append(chunk)
+        total_frames += len(chunk) // 2
+
+    return b"".join(merged), total_frames
 
 
 def generate_chunk_locked(
@@ -818,15 +927,22 @@ def synthesize_single_chunk_payload(payload: dict[str, Any]) -> dict[str, Any]:
         top_k=int(payload["top_k"]),
         repetition_penalty=float(payload["repetition_penalty"]),
         norm_loudness=bool(payload["norm_loudness"]),
-        seed=int(payload["seed"]),
+        seed=int(payload["seed"]) + int(payload.get("index", 0)) if int(payload["seed"]) > 0 else 0,
     )
+    pcm16 = pcm16_bytes_from_array(arr)
+    pcm_path = write_chunk_artifact(pcm16)
+    worker_id = f"pid:{os.getpid()}"
     return {
         "items": [
             {
                 "index": int(payload.get("index", 0)),
                 "sample_rate": sample_rate,
                 "voice_cached": voice_cache_hit,
-                "pcm16_base64": base64.b64encode(pcm16_bytes_from_array(arr)).decode("ascii"),
+                "frame_count": len(pcm16) // 2,
+                "pcm16_byte_count": len(pcm16),
+                "pcm16_path": str(pcm_path),
+                "worker_id": worker_id,
+                "worker_cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
             }
         ],
     }
@@ -835,6 +951,7 @@ def synthesize_single_chunk_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def synthesize_chunk_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
     voice_path = Path(payload["voice_path"]).resolve() if payload.get("voice_path") else None
     items_out: list[dict[str, Any]] = []
+    worker_id = f"pid:{os.getpid()}"
 
     for item in payload.get("items", []):
         arr, sample_rate, voice_cache_hit = generate_chunk_locked(
@@ -847,12 +964,18 @@ def synthesize_chunk_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
             norm_loudness=bool(payload["norm_loudness"]),
             seed=int(payload["seed"]) + int(item["index"]) if int(payload["seed"]) > 0 else 0,
         )
+        pcm16 = pcm16_bytes_from_array(arr)
+        pcm_path = write_chunk_artifact(pcm16)
         items_out.append(
             {
                 "index": int(item["index"]),
                 "sample_rate": sample_rate,
                 "voice_cached": voice_cache_hit,
-                "pcm16_base64": base64.b64encode(pcm16_bytes_from_array(arr)).decode("ascii"),
+                "frame_count": len(pcm16) // 2,
+                "pcm16_byte_count": len(pcm16),
+                "pcm16_path": str(pcm_path),
+                "worker_id": worker_id,
+                "worker_cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
             }
         )
 
@@ -877,6 +1000,8 @@ def response_with_audio(audio_bytes: bytes, meta: dict[str, Any]) -> Response:
         "X-Chunk-Target-Chars": str(meta["chunk_target_chars"]),
         "X-Output-Format": str(meta["output_format"]),
     }
+    if meta.get("chunk_worker_counts"):
+        headers["X-Chunk-Worker-Counts"] = json.dumps(meta["chunk_worker_counts"], sort_keys=True)
     if meta.get("rtf") is not None:
         headers["X-RTF"] = str(meta["rtf"])
     if meta.get("x_realtime") is not None:
@@ -951,6 +1076,7 @@ def runtime_status(include_sensitive: bool = True) -> dict[str, Any]:
         "worker_gpu_indices": WORKER_GPU_INDICES or None,
         "worker_count": configured_worker_count() if ENABLE_CELERY else None,
         "max_parallel_chunk_tasks": MAX_CELERY_PARALLEL_TASKS if ENABLE_CELERY else None,
+        "celery_chunk_dispatch_mode": CELERY_CHUNK_DISPATCH_MODE if ENABLE_CELERY else None,
         "voice_cache_entries": len(conditionals_cache),
         "voice_cache_size": VOICE_CACHE_SIZE,
         "celery_queue": CELERY_QUEUE if ENABLE_CELERY else None,
@@ -980,55 +1106,82 @@ def wait_for_celery_result(task) -> tuple[bytes, dict[str, Any]]:
     return base64.b64decode(audio_base64), payload["metadata"]
 
 
+def cleanup_chunk_artifacts(paths: list[str]) -> None:
+    for raw_path in paths:
+        try:
+            Path(raw_path).unlink(missing_ok=True)
+        except Exception:
+            logger.warning("Failed to delete chunk artifact: %s", raw_path, exc_info=True)
+
+
+def artifact_paths_from_payloads(payloads: list[dict[str, Any]]) -> list[str]:
+    paths: list[str] = []
+    for payload in payloads:
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict) and item.get("pcm16_path"):
+                paths.append(str(item["pcm16_path"]))
+    return paths
+
+
 def wait_for_celery_chunk_payloads(tasks: list) -> list[dict[str, Any]]:
     deadline = time.monotonic() + CELERY_TASK_TIMEOUT_SECONDS
     n = len(tasks)
-    done: dict[int, Any] = {}
+    payloads_by_index: list[Optional[dict[str, Any]]] = [None] * n
+    completed_payloads: list[dict[str, Any]] = []
+    pending = list(enumerate(tasks))
 
-    while time.monotonic() < deadline:
-        pending = [i for i in range(n) if i not in done]
-        if not pending:
-            break
-        for i in pending:
-            if tasks[i].ready():
-                done[i] = tasks[i]
-        if len(done) < n:
-            time.sleep(0.05)
-    else:
-        for i in range(n):
-            if i not in done:
-                try:
-                    tasks[i].revoke(terminate=True)
-                except Exception:
-                    pass
-        raise HTTPException(
-            status_code=504,
-            detail=f"Timed out waiting for {n - len(done)}/{n} Celery chunk tasks.",
-        )
+    try:
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"Timed out waiting for {len(pending)}/{n} Celery chunk tasks.",
+                )
 
-    payloads: list[dict[str, Any]] = []
-    for i in range(n):
-        if tasks[i].failed():
-            err = str(tasks[i].result)
-            for j in range(n):
-                if j == i:
+            still_pending: list[tuple[int, Any]] = []
+            for i, task in pending:
+                if not task.ready():
+                    still_pending.append((i, task))
                     continue
+
+                if task.failed():
+                    raise HTTPException(status_code=500, detail=f"Chunk {i} synthesis failed: {task.result}")
+
+                payload = task.result
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=500, detail=f"Chunk {i} returned an unexpected payload type.")
+
+                payloads_by_index[i] = payload
+                completed_payloads.append(payload)
                 try:
-                    tasks[j].revoke(terminate=True)
+                    task.forget()
                 except Exception:
                     pass
-            raise HTTPException(status_code=500, detail=f"Chunk {i} synthesis failed: {err}")
 
-        payload = tasks[i].result
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=500, detail=f"Chunk {i} returned an unexpected payload type.")
-        payloads.append(payload)
+            pending = still_pending
+            if pending:
+                time.sleep(0.05)
+    except Exception:
+        cleanup_chunk_artifacts(artifact_paths_from_payloads(completed_payloads))
+        for task in tasks:
+            if task.ready():
+                continue
+            try:
+                task.revoke(terminate=True)
+            except Exception:
+                pass
+        raise
 
-    return payloads
+    return [payload for payload in payloads_by_index if payload is not None]
 
 
-def decode_chunk_payload_items(payloads: list[dict[str, Any]]) -> list[tuple[int, np.ndarray, int, bool]]:
-    decoded_items: list[tuple[int, np.ndarray, int, bool]] = []
+def decode_chunk_payload_items(payloads: list[dict[str, Any]]) -> list[tuple[int, bytes, int, bool, Optional[str], str]]:
+    decoded_items: list[tuple[int, bytes, int, bool, Optional[str], str]] = []
+    artifact_root = CHUNK_ARTIFACT_DIR.resolve()
 
     for payload in payloads:
         if not isinstance(payload, dict):
@@ -1053,20 +1206,30 @@ def decode_chunk_payload_items(payloads: list[dict[str, Any]]) -> list[tuple[int
             sample_rate = int(item["sample_rate"])
             voice_cached = bool(item.get("voice_cached", False))
             index = int(item.get("index", 0))
+            artifact_path: Optional[str] = None
+            worker_id = str(item.get("worker_id") or "unknown")
 
-            if item.get("pcm16_base64"):
+            if item.get("pcm16_path"):
+                artifact = Path(str(item["pcm16_path"])).resolve()
+                if not artifact.is_relative_to(artifact_root):
+                    raise HTTPException(status_code=500, detail="Chunk task returned an invalid artifact path.")
+                if not artifact.exists() or not artifact.is_file():
+                    raise HTTPException(status_code=500, detail="Chunk artifact file was missing.")
+                raw = artifact.read_bytes()
+                artifact_path = str(artifact)
+            elif item.get("pcm16_base64"):
                 raw = base64.b64decode(item["pcm16_base64"])
-                arr = float_array_from_pcm16_bytes(raw)
             elif item.get("audio_base64"):
                 wav_bytes = base64.b64decode(item["audio_base64"])
                 arr, decoded_sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
                 if arr.ndim > 1:
                     arr = arr[:, 0]
                 sample_rate = int(decoded_sr)
+                raw = pcm16_bytes_from_array(arr.astype(np.float32, copy=False))
             else:
                 raise HTTPException(status_code=500, detail="Chunk task item returned no recognized audio field.")
 
-            decoded_items.append((index, arr.astype(np.float32, copy=False), sample_rate, voice_cached))
+            decoded_items.append((index, raw, sample_rate, voice_cached, artifact_path, worker_id))
 
     decoded_items.sort(key=lambda item: item[0])
     return decoded_items
@@ -1081,67 +1244,72 @@ def finalize_chunk_payloads(
     chunk_task_count: int,
 ) -> tuple[bytes, dict[str, Any]]:
     chunk_results = decode_chunk_payload_items(payloads)
-    if len(chunk_results) != chunk_count:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Expected {chunk_count} chunk results but received {len(chunk_results)}.",
-        )
+    artifact_paths = [path for *_prefix, path, _worker_id in chunk_results if path]
 
-    expected_sr: Optional[int] = None
-    arrays: list[np.ndarray] = []
-    voice_cache_hits: list[bool] = []
-    indices_seen: list[int] = []
+    try:
+        if len(chunk_results) != chunk_count:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Expected {chunk_count} chunk results but received {len(chunk_results)}.",
+            )
 
-    for index, arr, sample_rate, voice_cached in chunk_results:
-        if index < 0:
-            raise HTTPException(status_code=500, detail="Chunk task returned an invalid index.")
+        expected_sr: Optional[int] = None
+        pcm_chunks: list[bytes] = []
+        voice_cache_hits: list[bool] = []
+        indices_seen: list[int] = []
+        worker_ids: list[str] = []
+
+        for index, raw, sample_rate, voice_cached, _artifact_path, worker_id in chunk_results:
+            if index < 0:
+                raise HTTPException(status_code=500, detail="Chunk task returned an invalid index.")
+            if expected_sr is None:
+                expected_sr = sample_rate
+            elif sample_rate != expected_sr:
+                logger.warning("Sample-rate mismatch across chunks: %d vs %d — resampling ignored.", sample_rate, expected_sr)
+
+            indices_seen.append(index)
+            pcm_chunks.append(raw)
+            voice_cache_hits.append(voice_cached)
+            worker_ids.append(worker_id)
+
         if expected_sr is None:
-            expected_sr = sample_rate
-        elif sample_rate != expected_sr:
-            logger.warning("Sample-rate mismatch across chunks: %d vs %d — resampling ignored.", sample_rate, expected_sr)
+            raise HTTPException(status_code=500, detail="No sample rate was returned for chunk synthesis.")
+        if indices_seen != list(range(chunk_count)):
+            raise HTTPException(status_code=500, detail="Chunk task results were incomplete or out of order.")
 
-        indices_seen.append(index)
-        arrays.append(arr)
-        voice_cache_hits.append(voice_cached)
+        stitched_pcm16, total_frames = concatenate_pcm16_chunks(pcm_chunks, expected_sr)
+        audio_seconds = round(total_frames / expected_sr, 4)
+        wall_seconds = round(time.monotonic() - started, 4)
 
-    if expected_sr is None:
-        raise HTTPException(status_code=500, detail="No sample rate was returned for chunk synthesis.")
-    if indices_seen != list(range(chunk_count)):
-        raise HTTPException(status_code=500, detail="Chunk task results were incomplete or out of order.")
+        if output_format == "json_base64":
+            wav_bytes_out = wav_bytes_from_pcm16_bytes(stitched_pcm16, expected_sr)
+            final_bytes = json.dumps({"audio_base64": base64.b64encode(wav_bytes_out).decode("ascii")}).encode()
+            content_type = "application/json"
+            extension = "json"
+        else:
+            final_bytes, content_type, extension = encode_pcm16_bytes(stitched_pcm16, expected_sr, output_format)
 
-    stitched = concatenate_audio_arrays(arrays, expected_sr)
-    audio_seconds = round(len(stitched) / expected_sr, 4)
-    wall_seconds = round(time.monotonic() - started, 4)
+        meta = {
+            "chunk_count": chunk_count,
+            "chunk_task_count": chunk_task_count,
+            "sample_rate": expected_sr,
+            "voice_cached": any(voice_cache_hits),
+            "cache_entries": len(conditionals_cache),
+            "wall_seconds": wall_seconds,
+            "audio_seconds": audio_seconds,
+            "rtf": round(wall_seconds / audio_seconds, 4) if audio_seconds > 0 else None,
+            "x_realtime": round(audio_seconds / wall_seconds, 4) if wall_seconds > 0 else None,
+            "chunk_target_chars": AUTO_CHUNK_TARGET_CHARS,
+            "chunk_hard_limit": AUTO_CHUNK_HARD_LIMIT,
+            "chunk_worker_counts": dict(sorted(Counter(worker_ids).items())),
+            "output_format": output_format,
+            "content_type": content_type,
+            "filename": f"speech.{extension}",
+        }
 
-    if output_format == "mp3":
-        final_bytes, content_type, extension = encode_audio_bytes(stitched, expected_sr, "mp3")
-    elif output_format == "json_base64":
-        wav_bytes_out = wav_bytes_from_array(stitched, expected_sr)
-        final_bytes = json.dumps({"audio_base64": base64.b64encode(wav_bytes_out).decode("ascii")}).encode()
-        content_type = "application/json"
-        extension = "json"
-    else:
-        final_bytes = wav_bytes_from_array(stitched, expected_sr)
-        content_type = "audio/wav"
-        extension = "wav"
-
-    meta = {
-        "chunk_count": chunk_count,
-        "chunk_task_count": chunk_task_count,
-        "sample_rate": expected_sr,
-        "voice_cached": any(voice_cache_hits),
-        "cache_entries": len(conditionals_cache),
-        "wall_seconds": wall_seconds,
-        "audio_seconds": audio_seconds,
-        "rtf": round(wall_seconds / audio_seconds, 4) if audio_seconds > 0 else None,
-        "x_realtime": round(audio_seconds / wall_seconds, 4) if wall_seconds > 0 else None,
-        "chunk_target_chars": AUTO_CHUNK_TARGET_CHARS,
-        "output_format": output_format,
-        "content_type": content_type,
-        "filename": f"speech.{extension}",
-    }
-
-    return final_bytes, meta
+        return final_bytes, meta
+    finally:
+        cleanup_chunk_artifacts(artifact_paths)
 
 
 # -----------------------------
@@ -1151,6 +1319,7 @@ def finalize_chunk_payloads(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_dirs()
+    cleanup_stale_chunk_artifacts()
     ensure_idle_monitor_started()
 
     if not LAZY_LOAD_MODEL and not ENABLE_CELERY:
@@ -1235,26 +1404,14 @@ async def run_generation(
             "seed": seed,
         }
 
-        if chunk_count == 1:
-            # Single chunk — use the original task so the worker handles format encoding
-            payload = {**base_payload, "text": chunks[0], "output_format": output_format}
-            task = celery_app.send_task(
-                "chatterbox_turbo.synthesize",
-                kwargs={"payload": payload},
-                queue=CELERY_QUEUE,
-            )
-            return await anyio.to_thread.run_sync(
-                lambda: wait_for_celery_result(task), abandon_on_cancel=False
-            )
-
-        # Multiple chunks — dispatch all in parallel, stitch on the API server
         task_specs = build_chunk_task_specs(chunks, base_payload)
-        logger.info(
-            "Parallel dispatch: %d chunks across %d task(s) for %d chars",
-            chunk_count,
-            len(task_specs),
-            len(text),
-        )
+        if chunk_count > 1 or len(task_specs) > 1:
+            logger.info(
+                "Parallel dispatch: %d chunks across %d task(s) for %d chars",
+                chunk_count,
+                len(task_specs),
+                len(text),
+            )
         t_start = time.monotonic()
 
         tasks = [
