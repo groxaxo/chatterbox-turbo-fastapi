@@ -22,7 +22,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from chatterbox.tts_turbo import ChatterboxTurboTTS
@@ -88,7 +88,7 @@ DEFAULT_NORM_LOUDNESS = os.getenv("DEFAULT_NORM_LOUDNESS", "1") == "1"
 ALLOWED_AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 SUPPORTED_TTS_MODELS = {"tts-1", "tts-1-hd"}
 DEFAULT_VOICE_ALIASES = {"default", "alloy"}
-SUPPORTED_RESPONSE_FORMATS = {"wav", "mp3", "json_base64"}
+SUPPORTED_RESPONSE_FORMATS = {"wav", "mp3", "pcm", "json_base64"}
 WORKER_GPU_INDICES = os.getenv("WORKER_GPU_INDICES", "2,3").strip()
 WORKER_GPU_INDEX_LIST = [item.strip() for item in WORKER_GPU_INDICES.split(",") if item.strip()]
 MAX_CELERY_PARALLEL_TASKS = int(
@@ -526,6 +526,29 @@ def wav_bytes_from_pcm16_bytes(raw: bytes, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+def wav_stream_header(sample_rate: int, channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    byte_rate = sample_rate * channels * bits_per_sample // 8
+    block_align = channels * bits_per_sample // 8
+    data_size = 0xFFFFFFFF
+    riff_size = min(0xFFFFFFFF, 36 + data_size)
+    return b"".join(
+        [
+            b"RIFF",
+            riff_size.to_bytes(4, "little"),
+            b"WAVEfmt ",
+            (16).to_bytes(4, "little"),
+            (1).to_bytes(2, "little"),
+            channels.to_bytes(2, "little"),
+            sample_rate.to_bytes(4, "little"),
+            byte_rate.to_bytes(4, "little"),
+            block_align.to_bytes(2, "little"),
+            bits_per_sample.to_bytes(2, "little"),
+            b"data",
+            data_size.to_bytes(4, "little"),
+        ]
+    )
+
+
 def float_array_from_pcm16_bytes(raw: bytes) -> np.ndarray:
     if not raw:
         return np.zeros(0, dtype=np.float32)
@@ -573,6 +596,8 @@ def encode_audio_bytes(arr: np.ndarray, sample_rate: int, output_format: str) ->
         return wav_bytes_from_array(arr, sample_rate), "audio/wav", "wav"
     if output_format == "mp3":
         return mp3_bytes_from_array(arr, sample_rate), "audio/mpeg", "mp3"
+    if output_format == "pcm":
+        return pcm16_bytes_from_array(arr), "application/octet-stream", "pcm"
     raise RuntimeError(f"Unsupported output format: {output_format}")
 
 
@@ -581,6 +606,8 @@ def encode_pcm16_bytes(raw: bytes, sample_rate: int, output_format: str) -> tupl
         return wav_bytes_from_pcm16_bytes(raw, sample_rate), "audio/wav", "wav"
     if output_format == "mp3":
         return mp3_bytes_from_pcm16_bytes(raw, sample_rate), "audio/mpeg", "mp3"
+    if output_format == "pcm":
+        return raw, "application/octet-stream", "pcm"
     raise RuntimeError(f"Unsupported output format: {output_format}")
 
 
@@ -1338,6 +1365,7 @@ async def lifespan(app: FastAPI):
                     repetition_penalty=DEFAULT_REPETITION_PENALTY,
                     norm_loudness=DEFAULT_NORM_LOUDNESS,
                     seed=0,
+                    output_format="wav",
                 )
                 logger.info("Warmup complete.")
             except Exception as exc:
@@ -1371,6 +1399,7 @@ class SpeechRequest(BaseModel):
     norm_loudness: bool = DEFAULT_NORM_LOUDNESS
     seed: int = 0
     response_format: str = Field(DEFAULT_RESPONSE_FORMAT, description="mp3, wav, or json_base64")
+    stream: bool = False
 
 
 async def run_generation(
@@ -1455,6 +1484,116 @@ async def run_generation(
     )
 
 
+async def stream_generation(
+    *,
+    text: str,
+    voice_path: Optional[Path],
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    norm_loudness: bool,
+    seed: int,
+    output_format: str,
+):
+    chunks = chunk_text_for_tts(text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No text to synthesize after cleaning.")
+    if output_format == "json_base64":
+        raise HTTPException(status_code=400, detail="Streaming is not supported for json_base64.")
+
+    def encode_stream_chunk(raw: bytes, sample_rate: int, is_first: bool) -> bytes:
+        if output_format == "wav":
+            prefix = wav_stream_header(sample_rate) if is_first else b""
+            return prefix + raw
+        if output_format == "pcm":
+            return raw
+        return mp3_bytes_from_pcm16_bytes(raw, sample_rate)
+
+    pause_for = lambda sample_rate: b"\x00\x00" * max(0, int(sample_rate * (CHUNK_PAUSE_MS / 1000.0)))
+
+    if ENABLE_CELERY:
+        from celery_worker import celery_app
+
+        base_payload = {
+            "voice_path": str(voice_path) if voice_path else None,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repetition_penalty": repetition_penalty,
+            "norm_loudness": norm_loudness,
+            "seed": seed,
+        }
+        task_specs = build_chunk_task_specs(chunks, base_payload)
+        tasks = [
+            celery_app.send_task(task_name, kwargs={"payload": task_payload}, queue=CELERY_QUEUE)
+            for task_name, task_payload in task_specs
+        ]
+        payloads = await anyio.to_thread.run_sync(lambda: wait_for_celery_chunk_payloads(tasks), abandon_on_cancel=False)
+        chunk_results = decode_chunk_payload_items(payloads)
+        artifact_paths = [path for *_prefix, path, _worker_id in chunk_results if path]
+        try:
+            first = True
+            sample_rate: Optional[int] = None
+            for index, raw, sr, _voice_cached, _artifact_path, _worker_id in chunk_results:
+                if sample_rate is None:
+                    sample_rate = sr
+                elif sr != sample_rate:
+                    raise HTTPException(status_code=500, detail="Chunk sample rate mismatch.")
+                payload = raw if index == 0 else pause_for(sr) + raw
+                out = encode_stream_chunk(payload, sr, first)
+                first = False
+                if out:
+                    yield out
+        finally:
+            cleanup_chunk_artifacts(artifact_paths)
+        return
+
+    first = True
+    for index, chunk in enumerate(chunks):
+        chunk_seed = (seed + index) if seed > 0 else 0
+        arr, sample_rate, _voice_cache_hit = await anyio.to_thread.run_sync(
+            lambda: generate_chunk_locked(
+                text=chunk,
+                voice_path=voice_path,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                norm_loudness=norm_loudness,
+                seed=chunk_seed,
+            ),
+            abandon_on_cancel=False,
+        )
+        raw = pcm16_bytes_from_array(arr)
+        payload = raw if index == 0 else pause_for(sample_rate) + raw
+        out = encode_stream_chunk(payload, sample_rate, first)
+        first = False
+        if out:
+            yield out
+
+
+def streaming_response(generator, output_format: str) -> StreamingResponse:
+    content_type = {
+        "wav": "audio/wav",
+        "mp3": "audio/mpeg",
+        "pcm": "application/octet-stream",
+    }.get(output_format, "application/octet-stream")
+    extension = "pcm" if output_format == "pcm" else output_format
+    return StreamingResponse(
+        generator,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="speech.{extension}"',
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            "X-Sample-Rate": "24000",
+            "X-Audio-Encoding": "pcm_s16le" if output_format == "pcm" else f"{output_format}_stream",
+            "X-Chunk-Count": "streaming",
+        },
+    )
+
+
 # -----------------------------
 # Routes
 # -----------------------------
@@ -1517,6 +1656,7 @@ async def tts_multipart(
     norm_loudness: bool = Form(DEFAULT_NORM_LOUDNESS),
     seed: int = Form(0),
     response_format: str = Form(DEFAULT_RESPONSE_FORMAT),
+    stream: bool = Form(False),
 ):
     validate_generation_args(
         text=text,
@@ -1526,8 +1666,8 @@ async def tts_multipart(
         repetition_penalty=repetition_penalty,
     )
 
-    if response_format not in {"wav", "mp3"}:
-        raise HTTPException(status_code=400, detail="response_format must be 'wav' or 'mp3'.")
+    if response_format not in {"wav", "mp3", "pcm"}:
+        raise HTTPException(status_code=400, detail="response_format must be 'wav', 'mp3', or 'pcm'.")
 
     uploaded_path: Optional[Path] = None
 
@@ -1537,6 +1677,22 @@ async def tts_multipart(
             voice_path = uploaded_path
         else:
             voice_path = normalize_voice_path("alloy")
+
+        if stream:
+            return streaming_response(
+                stream_generation(
+                    text=text,
+                    voice_path=voice_path,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    norm_loudness=norm_loudness,
+                    seed=seed,
+                    output_format=response_format,
+                ),
+                response_format,
+            )
 
         wav_bytes, meta = await run_generation(
             text=text,
@@ -1588,6 +1744,23 @@ async def openai_style_speech(req: SpeechRequest):
     voice_path = normalize_voice_path(req.voice)
 
     try:
+        if req.stream:
+            output_format = "mp3" if req.response_format == "json_base64" else req.response_format
+            return streaming_response(
+                stream_generation(
+                    text=req.input,
+                    voice_path=voice_path,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    repetition_penalty=req.repetition_penalty,
+                    norm_loudness=req.norm_loudness,
+                    seed=req.seed,
+                    output_format=output_format,
+                ),
+                output_format,
+            )
+
         wav_bytes, meta = await run_generation(
             text=req.input,
             voice_path=voice_path,
