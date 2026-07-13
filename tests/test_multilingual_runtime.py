@@ -67,7 +67,7 @@ def test_download_dependencies_include_warm_base_and_persona():
         "lucia-cl-pilot",
     ]
     assert expand_profile_dependencies(["lucia-co-pilot", "lucia-ar"]) == [
+        "lucia-ar",
         "lucia-latam",
         "lucia-co-pilot",
-        "lucia-ar",
     ]
