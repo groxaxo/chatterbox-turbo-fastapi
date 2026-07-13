@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 
 
@@ -18,10 +19,7 @@ def _install_torch_stub() -> None:
         return
     torch = ModuleType("torch")
     torch.cuda = SimpleNamespace(is_available=lambda: False, empty_cache=lambda: None)
-    torch.inference_mode = lambda: SimpleNamespace(
-        __enter__=lambda self: None,
-        __exit__=lambda self, exc_type, exc, tb: False,
-    )
+    torch.inference_mode = nullcontext
     sys.modules["torch"] = torch
 
 
