@@ -1,50 +1,60 @@
 # Chatterbox Turbo English + Spanish FastAPI
 
-A production-oriented FastAPI and Celery wrapper for **official English Chatterbox Turbo** plus the **Lucía Latin-American Spanish fine-tunes** from `groxaxo/chaturbo-espanol`.
+Production-oriented FastAPI and Celery serving for:
 
-The same API process and worker pool can synthesize both languages without restarting:
+- the official English `ResembleAI/chatterbox-turbo` model;
+- the Lucía Latin-American Spanish artifacts from `groxaxo/chaturbo-espanol`;
+- one OpenAI-compatible endpoint that can switch languages per request without restarting.
 
-- English uses the untouched `ResembleAI/chatterbox-turbo` T3-Turbo model and normal reference-voice cloning.
-- Spanish uses the Lucía merged checkpoint or LoRA adapters from `groxaxo/chaturbo-espanol`.
-- The official base model is **not** included in the Spanish repository and is always loaded separately.
-- English and Spanish share the decoder, voice encoder, tokenizer, chunking, streaming, response encoding, and Celery infrastructure.
+The Spanish repository does **not** include the official base model. This service downloads or loads both repositories and reconstructs each profile with the correct training ancestry.
 
-## Supported voices and profiles
+## Profiles
 
-| OpenAI `voice` value | Language | Spanish artifact | Conditioning |
+Select the language/profile through the OpenAI `voice` field.
+
+| `voice` | Language | Exact T3 chain | Persona conditioning |
 |---|---|---|---|
-| `alloy` / `default` | English | Official base model | `DEFAULT_VOICE` or `voices/default.wav` |
-| Any local filename in `VOICE_DIR` | English | Official base model | Uploaded/local reference voice |
-| `lucia-ar` | es-AR | Merged T3 checkpoint | Bundled Lucía AR persona |
-| `lucia-latam` | es-419 | LoRA adapter on the official base | Bundled Lucía LATAM persona |
-| `lucia-cl-pilot` | es-CL | LoRA adapter on the official base | Lucía LATAM persona fallback |
-| `lucia-co-pilot` | es-CO | LoRA adapter on the official base | Lucía LATAM persona fallback |
+| `alloy` / `default` | English | Official Turbo | `DEFAULT_VOICE` or `voices/default.wav` |
+| filename in `VOICE_DIR` | English | Official Turbo | Selected reference file |
+| `lucia-ar` | es-AR | Official Turbo architecture → Lucía AR merged T3 | `lucia-ar/conditioning.pt` + `reference.wav` |
+| `lucia-latam` | es-419 | Official Turbo architecture → Lucía AR merged T3 → LATAM LoRA | `lucia-latam/conditioning.pt` + `reference.wav` |
+| `lucia-cl-pilot` | es-CL | Official Turbo architecture → Lucía AR merged T3 → Chile pilot LoRA | Lucía LATAM persona fallback |
+| `lucia-co-pilot` | es-CO | Official Turbo architecture → Lucía AR merged T3 → Colombia pilot LoRA | Lucía LATAM persona fallback |
 
-Convenience aliases include `lucia`, `spanish`, `es`, `es-AR`, `es-419`, `es-CL`, and `es-CO`.
+Aliases include `lucia`, `spanish`, `es`, `es-AR`, `es-419`, `es-CL`, `es-CO`, `argentina`, `chile`, and `colombia`.
 
-The Chilean and Colombian pilot artifact directories do not include their own `conditioning.pt` and `reference.wav`, so the runtime deliberately reuses the Lucía LATAM persona conditioning while applying the regional pilot adapter.
+The LATAM and pilot adapters are **continual LoRAs**. Applying them directly to the untouched official T3 is incorrect. The runtime first strict-loads `lucia-ar/t3_turbo_finetuned_merged.safetensors`, then applies the requested PEFT adapter.
 
 ## Architecture
 
-`server.py` remains the stable synthesis, chunking, streaming, voice-cache, and Celery implementation. The multilingual entrypoints install a profile-aware runtime layer:
+The existing `server.py` remains responsible for validation, sentence chunking, HTTP streaming, MP3/WAV/PCM encoding, voice caching, and Celery dispatch.
 
-- `multilingual_server.py` is the ASGI entrypoint.
-- `multilingual_celery_worker.py` is the Celery entrypoint.
-- `multilingual_runtime.py` manages model downloads, profile selection, strict checkpoint/adapter loading, persona conditioning, LRU eviction, and status reporting.
+The multilingual layer consists of:
 
-The English engine stays as the shared backbone. Spanish engines retain their own T3 model while sharing the English engine's S3Gen decoder, voice encoder, and tokenizer. This avoids loading a complete second Chatterbox stack for every Spanish profile.
+- `multilingual_runtime.py` — shared routing, model/cache lifecycle, Spanish normalization, persona conditioning, discovery, and response metadata;
+- `chaturbo_espanol_runtime.py` — exact artifact-chain reconstruction and provenance verification;
+- `multilingual_server.py` — ASGI entrypoint;
+- `multilingual_celery_worker.py` — Celery entrypoint.
 
-A worker can keep English and Spanish available together. `SPANISH_PROFILE_CACHE_SIZE` controls how many Spanish T3 variants remain resident in addition to English.
+The English engine remains the resident backbone. Spanish profiles keep their own T3 or PEFT-wrapped T3 while sharing the official engine's:
+
+- S3Gen decoder;
+- voice encoder;
+- tokenizer.
+
+This lets a worker serve English and Spanish simultaneously without loading a complete duplicate Chatterbox stack for every profile.
+
+All generation on one worker remains protected by the existing model lock because the decoder and voice encoder are shared. Parallelism comes from separate Celery workers/GPU processes.
 
 ## Install
 
 Requirements:
 
-- Python 3.11 recommended
-- FFmpeg
-- Redis when Celery mode is enabled
-- CUDA for normal production use; CPU also works but is slower
-- MPS is not recommended for this model because attention can exhaust unified memory
+- Python 3.11 recommended;
+- FFmpeg;
+- Redis when Celery mode is enabled;
+- CUDA for production performance; CPU is supported but slower;
+- MPS is not recommended because SDPA attention can exhaust unified memory.
 
 ```bash
 sudo apt update
@@ -55,20 +65,20 @@ cd chatterbox-turbo-fastapi
 ./install_cuda124.sh
 ```
 
-The installer adds the runtime dependencies required for merged checkpoints and adapters: `huggingface-hub`, `safetensors`, and `peft`.
+The installer pins the Spanish runtime stack used by the fine-tuning repository, including `transformers==5.2.0`, PEFT, safetensors, and `setuptools<81`.
 
-## Model download
+## Download models
 
 ### Automatic Hugging Face cache
 
-By default, the first worker request downloads:
+With `BASE_MODEL_DIR` and `SPANISH_MODEL_DIR` empty, the worker resolves:
 
-- `ResembleAI/chatterbox-turbo`
-- `groxaxo/chaturbo-espanol`
+- `ResembleAI/chatterbox-turbo`;
+- `groxaxo/chaturbo-espanol`.
 
-Set `HF_TOKEN` when the repository or deployment requires authentication.
+Set `HF_TOKEN` when authentication is required.
 
-### Explicit offline/local download
+### Explicit/offline download
 
 ```bash
 conda activate chatterbox-turbo-api
@@ -77,20 +87,25 @@ python download_models.py \
   --profiles lucia-ar,lucia-latam
 ```
 
-For every profile:
+Or download every profile:
 
 ```bash
 python download_models.py --output-dir ./models --profiles all
 ```
 
-Then configure:
+The downloader expands dependencies automatically:
+
+- requesting `lucia-latam` also downloads `lucia-ar`, because the AR merged checkpoint is its frozen base;
+- requesting a pilot also downloads `lucia-ar` and `lucia-latam`, because pilots require the AR warm base and LATAM persona files.
+
+Configure local paths:
 
 ```bash
 export BASE_MODEL_DIR="$PWD/models/chatterbox-turbo"
 export SPANISH_MODEL_DIR="$PWD/models/chaturbo-espanol"
 ```
 
-The runtime does not trust or require the absolute paths stored in the training host's `training_config.json`. It resolves the official base directory and each profile artifact directly from these environment variables or the Hugging Face cache.
+Absolute paths embedded in training-host JSON are not trusted. Runtime paths are resolved from these environment variables or the Hugging Face cache.
 
 ## Run
 
@@ -101,22 +116,22 @@ mkdir -p voices
 cp /path/to/english-reference.wav voices/default.wav
 ```
 
-Start the production API and configured Celery workers:
+Production launcher:
 
 ```bash
 ./run_api_service.sh
 ```
 
-Manual worker launch on a physical GPU:
+Manual workers on physical GPUs:
 
 ```bash
 ./run_celery_worker.sh 2
 ./run_celery_worker.sh 3
 ```
 
-The API remains on port `7766` by default.
+Default API address: `http://127.0.0.1:7766`.
 
-## OpenAI-compatible API
+## API examples
 
 ### English
 
@@ -132,17 +147,7 @@ curl -X POST http://127.0.0.1:7766/v1/audio/speech \
   --output english.mp3
 ```
 
-A local English reference file can be selected by filename:
-
-```json
-{
-  "model": "tts-1",
-  "voice": "my-speaker.wav",
-  "input": "This uses a file from VOICE_DIR."
-}
-```
-
-### Spanish Argentina — merged checkpoint
+### Lucía Argentina
 
 ```bash
 curl -X POST http://127.0.0.1:7766/v1/audio/speech \
@@ -160,7 +165,7 @@ curl -X POST http://127.0.0.1:7766/v1/audio/speech \
   --output lucia-ar.wav
 ```
 
-### Balanced LATAM — LoRA adapter
+### Lucía balanced LATAM
 
 ```bash
 curl -X POST http://127.0.0.1:7766/v1/audio/speech \
@@ -174,9 +179,7 @@ curl -X POST http://127.0.0.1:7766/v1/audio/speech \
   --output lucia-latam.mp3
 ```
 
-### Profile-specific endpoint
-
-The profile may also be placed in the URL. The request's `voice` value is overridden by the path profile:
+### Explicit profile route
 
 ```bash
 curl -X POST http://127.0.0.1:7766/v1/audio/speech/lucia-latam \
@@ -190,47 +193,19 @@ curl -X POST http://127.0.0.1:7766/v1/audio/speech/lucia-latam \
   --output explicit-profile.wav
 ```
 
-Responses include:
+The path profile overrides the body `voice` value.
 
-- `X-Chatterbox-Profile: english`, `lucia-ar`, `lucia-latam`, etc.
-- `X-Chatterbox-Language: en`, `es-AR`, `es-419`, etc.
-- Existing timing, chunking, cache, and output-format headers.
+Buffered audio responses include:
 
-## Discovery and status
+- `X-Chatterbox-Profile`;
+- `X-Chatterbox-Language`;
+- the existing timing, cache, chunk, and output-format headers.
 
-| Endpoint | Description |
-|---|---|
-| `GET /healthz` | Lightweight liveness probe |
-| `GET /status` | Runtime, GPU, Celery, and multilingual cache status |
-| `GET /profiles` | Spanish profile registry |
-| `GET /v1/profiles` | Versioned alias of `/profiles` |
-| `GET /v1/audio/voices` | English voices plus Lucía profiles |
-| `GET /v1/models` | OpenAI-compatible TTS model aliases |
-| `POST /v1/audio/speech` | OpenAI-compatible English or Spanish synthesis |
-| `POST /v1/audio/speech/{profile}` | Explicit Spanish profile synthesis |
-| `POST /tts` | Existing multipart English voice-upload endpoint |
-| `POST /warmup` | Existing English warmup endpoint |
-
-```bash
-curl -s http://127.0.0.1:7766/v1/profiles | jq .
-curl -s http://127.0.0.1:7766/status | jq .multilingual
-```
-
-## Open WebUI
-
-Use:
-
-- TTS engine: `OpenAI`
-- Base URL: `http://127.0.0.1:7766` or `http://127.0.0.1:7766/v1`
-- API key: any value; authentication is currently disabled by the launcher
-- Model: `tts-1`
-- Voice: `alloy`, `lucia-ar`, or `lucia-latam`
-
-The language is selected by the voice, so one Open WebUI endpoint can serve both English and Spanish.
+For `json_base64`, profile and language are included inside the returned metadata. The explicit profile route also adds profile headers to streaming responses.
 
 ## Streaming
 
-The existing `stream: true` behavior remains available for English and Spanish:
+English and Spanish both support `stream: true`:
 
 ```bash
 curl -N -X POST http://127.0.0.1:7766/v1/audio/speech \
@@ -245,58 +220,88 @@ curl -N -X POST http://127.0.0.1:7766/v1/audio/speech \
   | ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -i pipe:0
 ```
 
-Celery still synthesizes chunks in parallel and returns them in sentence order. Direct mode emits chunks as each one completes.
+Celery preserves sentence order after parallel chunk generation. Direct mode yields chunks sequentially as they complete.
+
+## Discovery
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /healthz` | Lightweight liveness |
+| `GET /health` | Liveness alias |
+| `GET /status` | Device, cache, Celery, and artifact-chain status |
+| `GET /profiles` | Spanish profile registry and base chain |
+| `GET /v1/profiles` | Versioned profile registry |
+| `GET /v1/audio/voices` | English voices plus Spanish profiles |
+| `GET /v1/models` | OpenAI-style model aliases |
+| `POST /v1/audio/speech` | English or Spanish synthesis |
+| `POST /v1/audio/speech/{profile}` | Explicit Spanish profile synthesis |
+| `POST /tts` | Multipart English reference upload |
+| `POST /warmup` | English warmup |
+
+```bash
+curl -s http://127.0.0.1:7766/v1/profiles | jq .
+curl -s http://127.0.0.1:7766/status | jq .multilingual
+```
+
+## Open WebUI
+
+Use:
+
+- TTS engine: `OpenAI`;
+- base URL: `http://127.0.0.1:7766` or `http://127.0.0.1:7766/v1`;
+- API key: any value with the default no-auth launcher;
+- model: `tts-1`;
+- voice: `alloy`, `lucia-ar`, `lucia-latam`, or another exposed profile.
+
+One endpoint can therefore serve both English and Spanish; the selected voice determines the profile.
 
 ## Configuration
 
-Copy `multilingual.env.example` into your deployment environment or add the settings to `/etc/chatterbox-turbo-fastapi.env`.
+See `multilingual.env.example`.
 
-Important variables:
-
-| Variable | Default | Meaning |
+| Variable | Default | Purpose |
 |---|---|---|
-| `BASE_MODEL_REPO` | `ResembleAI/chatterbox-turbo` | Official English/base checkpoint |
-| `BASE_MODEL_REVISION` | `main` | Base revision |
-| `BASE_MODEL_DIR` | empty | Offline/local base model directory |
-| `SPANISH_ENABLED` | `1` | Enable Lucía profile routing |
+| `BASE_MODEL_REPO` | `ResembleAI/chatterbox-turbo` | Official model repository |
+| `BASE_MODEL_REVISION` | `main` | Official model revision |
+| `BASE_MODEL_DIR` | empty | Local official model directory |
+| `SPANISH_ENABLED` | `1` | Enable Spanish profile routing |
 | `SPANISH_MODEL_REPO` | `groxaxo/chaturbo-espanol` | Spanish artifact repository |
-| `SPANISH_MODEL_REVISION` | `main` | Spanish revision |
-| `SPANISH_MODEL_DIR` | empty | Offline/local Spanish artifact directory |
+| `SPANISH_MODEL_REVISION` | `main` | Spanish artifact revision |
+| `SPANISH_MODEL_DIR` | empty | Local Spanish artifact directory |
 | `DEFAULT_SPANISH_PROFILE` | `lucia-ar` | Target for aliases such as `lucia` and `es` |
-| `SPANISH_PROFILE_CACHE_SIZE` | `1` | Spanish T3 variants retained per worker |
-| `PRELOAD_PROFILES` | empty | Comma-separated Spanish profiles to load at worker startup |
+| `SPANISH_PROFILE_CACHE_SIZE` | `1` | Number of Spanish T3 variants retained per worker |
+| `PRELOAD_PROFILES` | empty | Comma-separated Spanish profiles loaded at worker startup |
 | `STRICT_SPANISH_TAGS` | `1` | Reject unknown bracketed Turbo tags |
-| `HF_TOKEN` | empty | Hugging Face token when needed |
+| `VERIFY_MODEL_PROVENANCE` | `1` | Verify adapter and AR warm-base hashes when provenance exists |
+| `HF_TOKEN` | empty | Hugging Face authentication token |
 
 Optional persona overrides:
 
-- `LUCIA_REFERENCE_WAV`
-- `LUCIA_CONDITIONING_PT`
-- Per-profile forms such as `LUCIA_AR_REFERENCE_WAV` and `LUCIA_AR_CONDITIONING_PT`
+- `LUCIA_REFERENCE_WAV`;
+- `LUCIA_CONDITIONING_PT`;
+- per-profile variants such as `LUCIA_AR_REFERENCE_WAV` and `LUCIA_AR_CONDITIONING_PT`.
 
-Normally the bundled `reference.wav` and `conditioning.pt` should be used unchanged.
+Use the released persona files unless there is a deliberate deployment-specific replacement.
 
-## VRAM and cache policy
+## VRAM/cache policy
 
-English always supplies the shared backbone. Spanish profiles add only a separate T3/LoRA model and their conditionals.
+English remains resident as the shared backbone. Spanish profiles add a separate T3/LoRA model plus conditionals.
 
-For 12 GB workers, start with:
+For 12 GB workers:
 
 ```bash
 SPANISH_PROFILE_CACHE_SIZE=1
 PRELOAD_PROFILES=
 ```
 
-This keeps English plus the most recently used Spanish profile resident. Switching from `lucia-ar` to `lucia-latam` evicts the older Spanish T3 but does not unload English or the shared decoder.
+This retains English plus the most recently used Spanish profile. Switching Spanish profiles evicts only the least-recently-used Spanish engine.
 
-On larger GPUs, keep two Spanish profiles hot:
+For larger GPUs:
 
 ```bash
 SPANISH_PROFILE_CACHE_SIZE=2
 PRELOAD_PROFILES=lucia-ar,lucia-latam
 ```
-
-`PRELOAD_PROFILES` must not exceed the cache size unless intentional LRU eviction is acceptable.
 
 ## Systemd
 
@@ -304,29 +309,29 @@ PRELOAD_PROFILES=lucia-ar,lucia-latam
 sudo ./install_systemd_services.sh
 ```
 
-This installs:
+Installed units:
 
-- `chatterbox-turbo-fastapi.service`
-- `chatterbox-turbo-celery@.service`
-- `chatterbox-turbo.target`
+- `chatterbox-turbo-fastapi.service`;
+- `chatterbox-turbo-celery@.service`;
+- `chatterbox-turbo.target`.
 
-Configuration lives at:
+Environment file:
 
 ```text
 /etc/chatterbox-turbo-fastapi.env
 ```
 
-Existing environment files are preserved. Add the multilingual variables manually when upgrading an already installed service.
+Existing environment files are preserved during upgrades. Add the multilingual variables manually when one already exists.
 
 ## Test
+
+API smoke tests:
 
 ```bash
 ./test_curl.sh
 ```
 
-This checks discovery, English synthesis, Lucía AR synthesis, Lucía LATAM synthesis, response headers, and the existing path-traversal guard.
-
-Skip the Spanish generation calls while testing only API wiring:
+Skip actual Spanish generation while checking only API wiring:
 
 ```bash
 RUN_SPANISH_TESTS=0 ./test_curl.sh
@@ -339,11 +344,12 @@ python -m pip install -r requirements-dev.txt
 pytest -q
 ```
 
-## Important model notes
+## Model correctness notes
 
-- The Spanish Hugging Face repository contains only fine-tuned artifacts. It does not contain the official base model.
-- `lucia-ar/t3_turbo_finetuned_merged.safetensors` is loaded with `strict=True` after constructing the native Turbo T3.
-- The merged checkpoint legitimately has 298 tensors because the live Turbo model removes `tfmr.wte.weight` after loading the native tokenizer-compatible embedding structure.
-- LoRA profiles use `PeftModel.from_pretrained(..., is_trainable=False)` on a clean official Turbo T3.
-- Spanish text is NFC-normalized while preserving `ñ`, accents, `ü`, inverted punctuation, and recognized Turbo tags.
-- The API does not rewrite numbers, dates, currencies, abbreviations, or phone numbers because automatic expansion can change what should be spoken.
+- The official base model is always required.
+- `lucia-ar/t3_turbo_finetuned_merged.safetensors` is strict-loaded into the native Turbo T3.
+- The merged checkpoint's 298-key structure is expected because the live Turbo T3 removes `tfmr.wte.weight` after native embedding setup.
+- LATAM and pilot adapters are loaded only after strict-loading the Lucía AR merged warm base.
+- `adapter_provenance.json`, when present, is used to verify both adapter and warm-start SHA-256 values before PEFT loading.
+- Spanish text is NFC-normalized while preserving accents, `ñ`, `ü`, inverted punctuation, and recognized Turbo tags.
+- Numbers, dates, currencies, abbreviations, and phone numbers are not automatically rewritten because that can change the intended speech.
