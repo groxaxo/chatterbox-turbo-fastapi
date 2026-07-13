@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source-and-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install lightweight test dependencies
+        run: python -m pip install --upgrade pip pytest
+      - name: Compile Python entrypoints
+        run: |
+          python -m py_compile \
+            server.py \
+            celery_worker.py \
+            multilingual_runtime.py \
+            chaturbo_espanol_runtime.py \
+            multilingual_server.py \
+            multilingual_celery_worker.py \
+            download_models.py
+      - name: Validate shell scripts
+        run: |
+          bash -n install_cuda124.sh
+          bash -n install_systemd_services.sh
+          bash -n run_api_service.sh
+          bash -n run_celery_worker.sh
+          bash -n test_curl.sh
+      - name: Run unit tests
+        run: pytest -q
