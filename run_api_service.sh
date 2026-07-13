@@ -22,6 +22,19 @@ if [[ -z "$DEFAULT_VOICE" ]]; then
   fi
 fi
 
+# English base + Spanish Lucía profiles.
+export SPANISH_ENABLED="${SPANISH_ENABLED:-1}"
+export BASE_MODEL_REPO="${BASE_MODEL_REPO:-ResembleAI/chatterbox-turbo}"
+export BASE_MODEL_REVISION="${BASE_MODEL_REVISION:-main}"
+export BASE_MODEL_DIR="${BASE_MODEL_DIR:-}"
+export SPANISH_MODEL_REPO="${SPANISH_MODEL_REPO:-groxaxo/chaturbo-espanol}"
+export SPANISH_MODEL_REVISION="${SPANISH_MODEL_REVISION:-main}"
+export SPANISH_MODEL_DIR="${SPANISH_MODEL_DIR:-}"
+export DEFAULT_SPANISH_PROFILE="${DEFAULT_SPANISH_PROFILE:-lucia-ar}"
+export SPANISH_PROFILE_CACHE_SIZE="${SPANISH_PROFILE_CACHE_SIZE:-1}"
+export PRELOAD_PROFILES="${PRELOAD_PROFILES:-}"
+export STRICT_SPANISH_TAGS="${STRICT_SPANISH_TAGS:-1}"
+
 export ENABLE_CELERY="${ENABLE_CELERY:-1}"
 export CELERY_BROKER_URL="${CELERY_BROKER_URL:-redis://127.0.0.1:6379/14}"
 export CELERY_RESULT_BACKEND="${CELERY_RESULT_BACKEND:-$CELERY_BROKER_URL}"
@@ -50,4 +63,4 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 mkdir -p "$VOICE_DIR"
 
-exec "$UVICORN_BIN" server:app --host 0.0.0.0 --port "$PORT" --workers 1
+exec "$UVICORN_BIN" multilingual_server:app --host 0.0.0.0 --port "$PORT" --workers 1
