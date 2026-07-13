@@ -40,4 +40,11 @@ jobs:
           bash -n run_celery_worker.sh
           bash -n test_curl.sh
       - name: Run unit tests
-        run: pytest -q
+        run: pytest -q 2>&1 | tee pytest.log
+      - name: Upload unit-test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-log
+          path: pytest.log
+          if-no-files-found: warn
