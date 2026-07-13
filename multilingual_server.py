@@ -1,7 +1,7 @@
-"""ASGI entrypoint that layers English/Spanish profile routing over server.py."""
+"""ASGI entrypoint for official English Turbo plus chaturbo-espanol profiles."""
 
 import server
-from multilingual_runtime import install_multilingual_runtime
+from chaturbo_espanol_runtime import install_chaturbo_espanol_runtime
 
-runtime = install_multilingual_runtime(server)
+runtime = install_chaturbo_espanol_runtime(server)
 app = server.app
