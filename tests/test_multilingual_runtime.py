@@ -1,11 +1,21 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+from chaturbo_espanol_runtime import (
+    AR_MERGED_RELATIVE_PATH,
+    ChaturboEspanolRuntime,
+    CONTINUAL_LORA_PROFILES,
+)
+from download_models import expand_profile_dependencies
 from multilingual_runtime import MultilingualRuntime, normalize_spanish_text
 
 
 def runtime() -> MultilingualRuntime:
     return MultilingualRuntime(SimpleNamespace())
+
+
+def artifact_runtime() -> ChaturboEspanolRuntime:
+    return ChaturboEspanolRuntime(SimpleNamespace())
 
 
 def test_spanish_normalization_preserves_language_features():
@@ -32,8 +42,32 @@ def test_internal_profile_marker_round_trip():
 
 
 def test_pilot_profiles_use_latam_conditioning():
-    rt = runtime()
+    rt = artifact_runtime()
     payload = rt.profiles_payload()
     profiles = {item["id"]: item for item in payload["profiles"]}
     assert profiles["lucia-cl-pilot"]["conditioning_profile"] == "lucia-latam"
     assert profiles["lucia-co-pilot"]["conditioning_profile"] == "lucia-latam"
+
+
+def test_continual_loras_declare_ar_merged_base():
+    rt = artifact_runtime()
+    payload = rt.profiles_payload()
+    profiles = {item["id"]: item for item in payload["profiles"]}
+    for profile_id in CONTINUAL_LORA_PROFILES:
+        assert profiles[profile_id]["base_profile"] == "lucia-ar"
+        assert profiles[profile_id]["base_checkpoint"] == AR_MERGED_RELATIVE_PATH
+    assert profiles["lucia-ar"]["base_profile"] == "official-turbo"
+
+
+def test_download_dependencies_include_warm_base_and_persona():
+    assert expand_profile_dependencies(["lucia-latam"]) == ["lucia-ar", "lucia-latam"]
+    assert expand_profile_dependencies(["lucia-cl-pilot"]) == [
+        "lucia-ar",
+        "lucia-latam",
+        "lucia-cl-pilot",
+    ]
+    assert expand_profile_dependencies(["lucia-co-pilot", "lucia-ar"]) == [
+        "lucia-latam",
+        "lucia-co-pilot",
+        "lucia-ar",
+    ]
