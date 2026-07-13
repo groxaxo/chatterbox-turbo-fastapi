@@ -16,18 +16,37 @@ if [[ ! -f /etc/chatterbox-turbo-fastapi.env ]]; then
   if [[ -f /home/op/Libro-Gregoria-Variacion/audio/britishWoman_clean.wav ]]; then
     DEFAULT_VOICE_VALUE="/home/op/Libro-Gregoria-Variacion/audio/britishWoman_clean.wav"
   fi
-  cat >/etc/chatterbox-turbo-fastapi.env <<EOF
+  cat >/etc/chatterbox-turbo-fastapi.env <<EOF_ENV
 ALLOW_NO_AUTH=1
 PORT=7766
 VOICE_DIR=/home/op/chatterbox-turbo-fastapi/voices
 DEFAULT_VOICE=${DEFAULT_VOICE_VALUE}
+
+# Official English base model. Leave BASE_MODEL_DIR empty to use the HF cache.
+BASE_MODEL_REPO=ResembleAI/chatterbox-turbo
+BASE_MODEL_REVISION=main
+BASE_MODEL_DIR=
+
+# Lucía Spanish profiles. Leave SPANISH_MODEL_DIR empty to use the HF cache.
+SPANISH_ENABLED=1
+SPANISH_MODEL_REPO=groxaxo/chaturbo-espanol
+SPANISH_MODEL_REVISION=main
+SPANISH_MODEL_DIR=
+DEFAULT_SPANISH_PROFILE=lucia-ar
+SPANISH_PROFILE_CACHE_SIZE=1
+PRELOAD_PROFILES=
+STRICT_SPANISH_TAGS=1
+VERIFY_MODEL_PROVENANCE=1
+
 ENABLE_CELERY=1
 CELERY_BROKER_URL=redis://127.0.0.1:6379/14
 CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/14
 CELERY_QUEUE=chatterbox_tts
 LAZY_LOAD_MODEL=1
-MODEL_IDLE_UNLOAD_SECONDS=900
+MODEL_IDLE_UNLOAD_SECONDS=300
 MODEL_IDLE_CHECK_INTERVAL_SECONDS=30
+MIN_FREE_VRAM_MB=3500
+MODEL_LOAD_WAIT_TIMEOUT_SECONDS=60
 AUTO_CHUNK_ENABLED=1
 AUTO_CHUNK_TARGET_CHARS=520
 AUTO_CHUNK_HARD_LIMIT=580
@@ -38,7 +57,7 @@ MAX_UPLOAD_MB=25
 VOICE_CACHE_SIZE=8
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 EXPECTED_GPU_NAME=RTX 3060
-EOF
+EOF_ENV
   chmod 600 /etc/chatterbox-turbo-fastapi.env
 fi
 

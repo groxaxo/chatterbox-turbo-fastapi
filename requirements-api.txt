@@ -8,3 +8,7 @@ anyio>=4.0.0
 celery[redis]>=5.4.0,<6.0.0
 redis>=5.2.1,<6.0.0
 chatterbox-tts==0.1.7
+transformers==5.2.0
+huggingface-hub>=0.30.0
+safetensors>=0.5.3
+peft>=0.18.0,<0.20.0

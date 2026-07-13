@@ -7,10 +7,13 @@ __pycache__/
 dist/
 build/
 .eggs/
+.pytest_cache/
+.coverage
 
 # Environment
 .env
 *.env
+!multilingual.env.example
 venv/
 .venv/
 env/
@@ -23,13 +26,16 @@ env/
 
 # Runtime artefacts
 server.log
-speech.wav
+speech*.wav
+speech*.mp3
+speech*.pcm
 *.log
 
 # Voice files (can be large; user-provided)
 voices/
 
-# Model weights
+# Downloaded model snapshots and weights
+models/
 *.gguf
 *.pt
 *.safetensors
