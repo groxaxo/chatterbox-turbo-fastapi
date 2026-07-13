@@ -2,7 +2,7 @@
 set -euo pipefail
 
 API="${API:-http://127.0.0.1:7766}"
-VOICE="${VOICE:-voices/default.wav}"
+RUN_SPANISH_TESTS="${RUN_SPANISH_TESTS:-1}"
 
 echo "==> /healthz (no auth)"
 curl -sf "$API/healthz" | jq .
@@ -19,11 +19,14 @@ curl -sf "$API/v1/audio/models" | jq .
 echo "==> /v1/audio/voices"
 curl -sf "$API/v1/audio/voices" | jq .
 
-echo "==> /v1/audio/speech (default MP3 / Open WebUI path)"
+echo "==> /v1/profiles"
+curl -sf "$API/v1/profiles" | jq .
+
+echo "==> English /v1/audio/speech (default MP3 / Open WebUI path)"
 curl -sf -X POST "$API/v1/audio/speech" \
   -H "content-type: application/json" \
   -d '{
-    "input": "Hi there, this is Chatterbox Turbo running behind the lazy loaded Celery server.",
+    "input": "Hi there, this is the English Chatterbox Turbo voice.",
     "voice": "alloy",
     "model": "tts-1",
     "temperature": 0.8,
@@ -31,28 +34,45 @@ curl -sf -X POST "$API/v1/audio/speech" \
     "top_k": 1000,
     "repetition_penalty": 1.2
   }' \
-  --output speech.mp3 \
-  -D - | grep -E "x-voice-cached|x-rtf|x-wall|x-output-format"
+  --output speech-en.mp3 \
+  -D - | grep -Ei "x-chatterbox-profile|x-chatterbox-language|x-voice-cached|x-rtf|x-wall|x-output-format"
+file speech-en.mp3
 
-file speech.mp3
+if [[ "$RUN_SPANISH_TESTS" == "1" ]]; then
+  echo "==> Spanish Argentina via voice=lucia-ar"
+  curl -sf -X POST "$API/v1/audio/speech" \
+    -H "content-type: application/json" \
+    -d '{
+      "input": "¡Hola! Soy Lucía, y esta es una prueba de español argentino.",
+      "voice": "lucia-ar",
+      "model": "tts-1",
+      "response_format": "wav",
+      "temperature": 0.75,
+      "top_p": 0.95,
+      "top_k": 1000,
+      "repetition_penalty": 1.2
+    }' \
+    --output speech-es-ar.wav \
+    -D - | grep -Ei "x-chatterbox-profile|x-chatterbox-language|x-voice-cached|x-rtf|x-wall|x-output-format"
+  file speech-es-ar.wav
 
-echo "==> /v1/audio/speech (explicit WAV)"
-curl -sf -X POST "$API/v1/audio/speech" \
-  -H "content-type: application/json" \
-  -d '{
-    "input": "Return an explicit WAV please.",
-    "voice": "alloy",
-    "model": "tts-1",
-    "temperature": 0.8,
-    "top_p": 0.95,
-    "top_k": 1000,
-    "repetition_penalty": 1.2,
-    "response_format": "wav"
-  }' \
-  --output speech.wav \
-  -D - | grep -E "x-voice-cached|x-rtf|x-wall|x-output-format"
-
-file speech.wav
+  echo "==> Spanish LATAM via profile-specific endpoint"
+  curl -sf -X POST "$API/v1/audio/speech/lucia-latam" \
+    -H "content-type: application/json" \
+    -d '{
+      "input": "Hola, esta es una prueba de la voz latinoamericana equilibrada.",
+      "voice": "alloy",
+      "model": "tts-1",
+      "response_format": "wav",
+      "temperature": 0.75,
+      "top_p": 0.95,
+      "top_k": 1000,
+      "repetition_penalty": 1.2
+    }' \
+    --output speech-es-latam.wav \
+    -D - | grep -Ei "x-chatterbox-profile|x-chatterbox-language|x-voice-cached|x-rtf|x-wall|x-output-format"
+  file speech-es-latam.wav
+fi
 
 echo "==> Path traversal must return 400"
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/v1/audio/speech" \
