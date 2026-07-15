@@ -1,0 +1,38 @@
+[
+  {
+    "name": "english-short",
+    "voice": "alloy",
+    "text": "Hello. This is a fixed short English parity test.",
+    "seed": 1234
+  },
+  {
+    "name": "english-medium-tags",
+    "voice": "alloy",
+    "text": "Welcome to the benchmark. [chuckle] We are checking timing, token identity, and waveform identity without changing the voice or sampling settings.",
+    "seed": 2234
+  },
+  {
+    "name": "lucia-ar-short",
+    "voice": "lucia-ar",
+    "text": "¡Hola! Esta es una prueba corta de paridad en español argentino.",
+    "seed": 3234
+  },
+  {
+    "name": "lucia-latam-medium",
+    "voice": "lucia-latam",
+    "text": "Hola. Esta prueba latinoamericana verifica que la optimización conserve exactamente los mismos tokens y la misma forma de onda.",
+    "seed": 4234
+  },
+  {
+    "name": "lucia-cl-pilot-medium",
+    "voice": "lucia-cl-pilot",
+    "text": "Hola, esta es una prueba controlada del perfil chileno, con pausas naturales y puntuación estable.",
+    "seed": 5234
+  },
+  {
+    "name": "lucia-co-pilot-long",
+    "voice": "lucia-co-pilot",
+    "text": "Buenos días. Esta prueba más extensa comprueba la estabilidad del perfil colombiano durante una generación larga. Debe mantener la identidad del hablante, la duración, la inteligibilidad y cada token de voz bajo una semilla fija.",
+    "seed": 6234
+  }
+]

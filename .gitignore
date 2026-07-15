@@ -30,6 +30,8 @@ speech*.wav
 speech*.mp3
 speech*.pcm
 *.log
+artifacts/
+benchmarks/parity_cases.local.json
 
 # Voice files (can be large; user-provided)
 voices/

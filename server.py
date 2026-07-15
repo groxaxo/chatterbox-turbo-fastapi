@@ -28,17 +28,10 @@ from pydantic import BaseModel, Field
 import chatterbox.tts_turbo as chatterbox_tts_turbo
 
 from watermark_control import configure_watermarking
-from turbo_runtime_optimizations import configure_turbo_runtime
 
 
 ENABLE_WATERMARK = os.getenv("ENABLE_WATERMARK", "0") == "1"
 WATERMARK_MODE = configure_watermarking(chatterbox_tts_turbo, enabled=ENABLE_WATERMARK)
-ENABLE_TURBO_FAST_PATH = os.getenv("ENABLE_TURBO_FAST_PATH", "1") == "1"
-TURBO_OPTIMIZATION_STATE = configure_turbo_runtime(
-    chatterbox_tts_turbo,
-    enabled=ENABLE_TURBO_FAST_PATH,
-    conditioning_cache_size=int(os.getenv("VOICE_CACHE_SIZE", "8")),
-)
 ChatterboxTurboTTS = chatterbox_tts_turbo.ChatterboxTurboTTS
 
 logging.basicConfig(
@@ -48,7 +41,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("chatterbox_api")
 logger.info("Chatterbox watermark mode: %s", WATERMARK_MODE)
-logger.info("Chatterbox Turbo fast path: %s", TURBO_OPTIMIZATION_STATE.mode)
 
 
 # -----------------------------
@@ -231,6 +223,20 @@ def current_t3_attention_backend() -> str:
         return "unloaded"
     config = getattr(getattr(getattr(model, "t3", None), "tfmr", None), "config", None)
     return str(getattr(config, "_attn_implementation", "unknown"))
+
+
+def turbo_performance_metadata() -> dict[str, Any]:
+    runtime = globals().get("_turbo_performance_runtime")
+    if runtime is None:
+        return {"enabled": False, "mode": "not-installed", "package_version": None}
+    enabled = bool(runtime.enabled)
+    compatible = bool(runtime.package_compatible)
+    mode = "enabled" if enabled and compatible else "fallback" if enabled else "disabled"
+    return {
+        "enabled": enabled,
+        "mode": mode,
+        "package_version": runtime.chatterbox_version,
+    }
 
 
 def unload_model_locked(reason: str) -> None:
@@ -980,6 +986,7 @@ def synthesize_single_chunk_payload(payload: dict[str, Any]) -> dict[str, Any]:
     pcm16 = pcm16_bytes_from_array(arr)
     pcm_path = write_chunk_artifact(pcm16)
     worker_id = f"pid:{os.getpid()}"
+    turbo_metadata = turbo_performance_metadata()
     return {
         "items": [
             {
@@ -992,10 +999,10 @@ def synthesize_single_chunk_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "worker_id": worker_id,
                 "worker_cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
                 "worker_watermark_mode": WATERMARK_MODE,
-                "worker_turbo_fast_path": TURBO_OPTIMIZATION_STATE.mode,
+                "worker_turbo_fast_path": turbo_metadata["mode"],
                 "worker_t3_attention_backend": current_t3_attention_backend(),
                 "worker_warmup_complete": worker_warmup_complete,
-                "worker_chatterbox_version": TURBO_OPTIMIZATION_STATE.package_version,
+                "worker_chatterbox_version": turbo_metadata["package_version"],
             }
         ],
     }
@@ -1005,6 +1012,7 @@ def synthesize_chunk_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
     voice_path = Path(payload["voice_path"]).resolve() if payload.get("voice_path") else None
     items_out: list[dict[str, Any]] = []
     worker_id = f"pid:{os.getpid()}"
+    turbo_metadata = turbo_performance_metadata()
 
     for item in payload.get("items", []):
         arr, sample_rate, voice_cache_hit = generate_chunk_locked(
@@ -1030,10 +1038,10 @@ def synthesize_chunk_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "worker_id": worker_id,
                 "worker_cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
                 "worker_watermark_mode": WATERMARK_MODE,
-                "worker_turbo_fast_path": TURBO_OPTIMIZATION_STATE.mode,
+                "worker_turbo_fast_path": turbo_metadata["mode"],
                 "worker_t3_attention_backend": current_t3_attention_backend(),
                 "worker_warmup_complete": worker_warmup_complete,
-                "worker_chatterbox_version": TURBO_OPTIMIZATION_STATE.package_version,
+                "worker_chatterbox_version": turbo_metadata["package_version"],
             }
         )
 
@@ -1123,6 +1131,7 @@ def runtime_status(include_sensitive: bool = True) -> dict[str, Any]:
         except Exception:
             gpu = None
 
+    turbo_metadata = turbo_performance_metadata()
     return {
         "ok": True,
         "backend_mode": "celery" if ENABLE_CELERY else "direct",
@@ -1146,9 +1155,9 @@ def runtime_status(include_sensitive: bool = True) -> dict[str, Any]:
         "default_response_format": DEFAULT_RESPONSE_FORMAT,
         "watermark_enabled": ENABLE_WATERMARK,
         "api_watermark_mode": WATERMARK_MODE,
-        "turbo_fast_path_enabled": ENABLE_TURBO_FAST_PATH,
-        "api_turbo_fast_path": TURBO_OPTIMIZATION_STATE.mode,
-        "api_chatterbox_version": TURBO_OPTIMIZATION_STATE.package_version,
+        "turbo_fast_path_enabled": turbo_metadata["enabled"],
+        "api_turbo_fast_path": turbo_metadata["mode"],
+        "api_chatterbox_version": turbo_metadata["package_version"],
         "worker_gpu_indices": WORKER_GPU_INDICES or None,
         "worker_count": configured_worker_count() if ENABLE_CELERY else None,
         "max_parallel_chunk_tasks": MAX_CELERY_PARALLEL_TASKS if ENABLE_CELERY else None,

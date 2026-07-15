@@ -65,12 +65,12 @@ The API status identifies its local mode as `api_watermark_mode`; buffered synth
 
 ## Turbo fast path
 
-`turbo_runtime_optimizations.py` applies an exact-output compatibility layer before any engine is
+`performance_runtime.py` applies an exact-output compatibility layer after multilingual routing is
 constructed. Inspired by the conditioning cache and persistent serving design in
 `groxaxo/chatterbox-vllm2`, it caches each T3 engine's final encoded conditionals and removes repeated
 token-history allocation and progress rendering from Turbo decoding. It does not transplant vLLM,
-change attention, alter sampling, reduce MeanFlow steps, or change precision. Source fingerprints
-fail startup if the pinned upstream methods change while the fast path is enabled.
+change attention, alter sampling, reduce MeanFlow steps, or change precision. Package-version and
+source-marker guards fall back to upstream behavior if the pinned methods change.
 
 English and every Spanish profile retain separate T3 instances and therefore separate encoded
 conditioning caches. Worker response metadata reports the effective fast-path mode.
