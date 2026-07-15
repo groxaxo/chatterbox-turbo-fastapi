@@ -50,9 +50,29 @@ def test_disabled_runtime_preserves_generation(monkeypatch):
     assert server.runtime_status()["performance"]["enabled"] is False
 
 
+def test_default_allowlist_accepts_installed_017(monkeypatch):
+    monkeypatch.setenv("TURBO_PERFORMANCE_RUNTIME", "1")
+    monkeypatch.delenv("TURBO_EXPECTED_CHATTERBOX_VERSION", raising=False)
+    monkeypatch.delenv("TURBO_EXPECTED_CHATTERBOX_VERSIONS", raising=False)
+    monkeypatch.setattr(
+        performance_runtime,
+        "_distribution_version",
+        lambda name: "0.1.7" if name == "chatterbox-tts" else "test",
+    )
+
+    runtime = performance_runtime.TurboPerformanceRuntime(
+        _FakeServer(),
+        _FakeMultilingual(),
+    )
+
+    assert runtime.expected_package_versions == ("0.1.6", "0.1.7")
+    assert runtime.package_compatible is True
+
+
 def test_version_mismatch_disables_source_sensitive_rewrites(monkeypatch):
     monkeypatch.setenv("TURBO_PERFORMANCE_RUNTIME", "1")
-    monkeypatch.setenv("TURBO_EXPECTED_CHATTERBOX_VERSION", "0.1.6")
+    monkeypatch.setenv("TURBO_EXPECTED_CHATTERBOX_VERSIONS", "0.1.6,0.1.7")
+    monkeypatch.delenv("TURBO_EXPECTED_CHATTERBOX_VERSION", raising=False)
     monkeypatch.setattr(
         performance_runtime,
         "_distribution_version",
@@ -64,6 +84,24 @@ def test_version_mismatch_disables_source_sensitive_rewrites(monkeypatch):
         _FakeMultilingual(),
     )
 
+    assert runtime.package_compatible is False
+
+
+def test_legacy_single_version_override_is_preserved(monkeypatch):
+    monkeypatch.setenv("TURBO_EXPECTED_CHATTERBOX_VERSION", "0.1.6")
+    monkeypatch.setenv("TURBO_EXPECTED_CHATTERBOX_VERSIONS", "0.1.6,0.1.7")
+    monkeypatch.setattr(
+        performance_runtime,
+        "_distribution_version",
+        lambda name: "0.1.7" if name == "chatterbox-tts" else "test",
+    )
+
+    runtime = performance_runtime.TurboPerformanceRuntime(
+        _FakeServer(),
+        _FakeMultilingual(),
+    )
+
+    assert runtime.expected_package_versions == ("0.1.6",)
     assert runtime.package_compatible is False
 
 
@@ -133,15 +171,17 @@ def test_generate_wrapper_does_not_add_cuda_synchronize(monkeypatch):
     assert cache_hit is False
 
 
-def test_source_guards_and_experimental_backends_remain_off():
+def test_source_guards_and_default_acceleration_remain_off():
     root = Path(performance_runtime.__file__).parent
     runtime_source = (root / "performance_runtime.py").read_text(encoding="utf-8")
     patch_source = (root / "performance_patches.py").read_text(encoding="utf-8")
     support_source = (root / "performance_support.py").read_text(encoding="utf-8")
+    acceleration_source = (root / "acceleration_runtime.py").read_text(encoding="utf-8")
 
     assert "source_matches" in patch_source
     assert "def source_matches" in support_source
-    assert "TURBO_EXPECTED_CHATTERBOX_VERSION" in runtime_source
+    assert "TURBO_EXPECTED_CHATTERBOX_VERSIONS" in runtime_source
+    assert 'os.getenv("TURBO_ACCELERATOR", "torch")' in acceleration_source
     assert '"sdpa": False' in runtime_source
     assert '"torch_compile": False' in runtime_source
     assert '"microbatching": False' in runtime_source
