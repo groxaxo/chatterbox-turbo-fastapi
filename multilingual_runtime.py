@@ -231,6 +231,10 @@ class MultilingualRuntime:
                 "t3_turbo_v1.safetensors",
                 "s3gen_meanflow.safetensors",
                 "ve.safetensors",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+                "vocab.json",
+                "merges.txt",
             )
             missing = [name for name in required if not (path / name).is_file()]
             if missing:
@@ -512,8 +516,6 @@ class MultilingualRuntime:
                 )
 
             sample_rate = int(engine.sr)
-            if server.DEVICE.startswith("cuda"):
-                torch.cuda.synchronize()
             server.touch_model_usage()
             return server.tensor_to_float_array(waveform), sample_rate, was_cached
 

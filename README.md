@@ -273,6 +273,11 @@ See `multilingual.env.example`.
 | `PRELOAD_PROFILES` | empty | Comma-separated Spanish profiles loaded at worker startup |
 | `STRICT_SPANISH_TAGS` | `1` | Reject unknown bracketed Turbo tags |
 | `VERIFY_MODEL_PROVENANCE` | `1` | Verify adapter and AR warm-base hashes when provenance exists |
+| `ENABLE_WATERMARK` | `0` | Enable the upstream Perth implicit watermark post-processing stage |
+| `ENABLE_TURBO_FAST_PATH` | `1` | Cache encoded conditioning and remove exact-output-neutral Turbo loop overhead |
+| `WORKER_LAZY_LOAD_MODEL` | `0` | Set to `1` to defer loading the GPU model until the first request |
+| `WORKER_MODEL_IDLE_UNLOAD_SECONDS` | `0` | Unload a resident worker model after this idle period; `0` disables unloading |
+| `WORKER_STARTUP_WARMUP` | `1` | Run a synthesis warmup when the worker starts |
 | `HF_TOKEN` | empty | Hugging Face authentication token |
 
 Optional persona overrides:
@@ -282,6 +287,29 @@ Optional persona overrides:
 - per-profile variants such as `LUCIA_AR_REFERENCE_WAV` and `LUCIA_AR_CONDITIONING_PT`.
 
 Use the released persona files unless there is a deliberate deployment-specific replacement.
+
+Watermarking is disabled by default. With `ENABLE_WATERMARK=0`, the worker replaces the Perth
+watermarker before constructing any English or Spanish engine, so PerthNet is not loaded and the
+synthesized waveform is returned unchanged. Set `ENABLE_WATERMARK=1` and restart the API and workers
+only when implicit watermarking is required. This setting does not alter T3/S3 generation, voice
+conditioning, sampling parameters, or output encoding.
+
+`GET /status` reports the API process setting as `api_watermark_mode`. Buffered synthesis responses
+also return `X-Worker-Watermark-Modes`, which confirms the effective mode inside the GPU worker that
+generated the audio.
+
+The default Turbo fast path adapts two ideas from `groxaxo/chatterbox-vllm2` without replacing the
+Turbo model or installing vLLM: workers cache final encoded voice conditioning, and autoregressive
+generation avoids rebuilding token history on every step. It also suppresses production progress
+rendering and skips a redundant CUDA synchronization after the waveform has already moved to CPU.
+Source fingerprints guard the compatibility patch against upstream implementation changes. Set
+`ENABLE_TURBO_FAST_PATH=0` and restart to use the unmodified installed runtime.
+
+Production workers load and warm the model before serving queued synthesis work and remain resident
+by default. Bootstrap runs while the Celery module is importing, before the worker can announce
+readiness; model-load, compatibility, OOM, or warmup failures therefore terminate the worker instead
+of exposing a cold or broken queue consumer. This moves model loading, voice conditioning, and CUDA
+warmup out of user request latency.
 
 ## VRAM/cache policy
 

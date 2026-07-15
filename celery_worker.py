@@ -1,12 +1,13 @@
 import os
 
-from celery import Celery, signals
+from celery import Celery
 
 from server import (
     CELERY_BROKER_URL,
     CELERY_QUEUE,
     CELERY_RESULT_BACKEND,
     logger,
+    runtime_status,
     synthesize_payload,
     synthesize_chunk_batch_payload,
     synthesize_single_chunk_payload,
@@ -31,12 +32,16 @@ celery_app.conf.update(
 )
 
 
-@signals.worker_ready.connect
-def preload_worker_model(**_: object) -> None:
-    try:
-        warm_worker_model_if_needed()
-    except Exception:
-        logger.exception("Worker preload failed")
+@celery_app.task(name="chatterbox_turbo.runtime_status")
+def worker_runtime_status() -> dict[str, object]:
+    return runtime_status(include_sensitive=True)
+
+
+def bootstrap_worker_runtime() -> None:
+    """Load and warm the model before Celery can announce this worker as ready."""
+
+    logger.info("Bootstrapping Chatterbox worker runtime before Celery startup.")
+    warm_worker_model_if_needed()
 
 
 @celery_app.task(name="chatterbox_turbo.synthesize")
@@ -74,3 +79,7 @@ def synthesize_chunk_batch(payload: dict[str, object]) -> dict[str, object]:
         len(items) if isinstance(items, list) else 0,
     )
     return synthesize_chunk_batch_payload(payload)
+
+
+if os.getenv("CHATTERBOX_WORKER_BOOTSTRAP", "0") == "1":
+    bootstrap_worker_runtime()

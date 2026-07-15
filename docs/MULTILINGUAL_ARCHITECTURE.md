@@ -53,6 +53,33 @@ The LATAM and pilot adapters are continual LoRAs trained on the AR-merged frozen
 
 A mismatch fails before PEFT loading.
 
+## Watermarking
+
+`server.py` configures the shared Chatterbox class before any English or Spanish engine is created.
+By default, `ENABLE_WATERMARK=0` replaces the upstream Perth watermarker with an identity adapter,
+avoiding PerthNet model loading and post-generation processing. Setting `ENABLE_WATERMARK=1` restores
+the upstream behavior after the API and workers are restarted. The setting does not change the T3,
+S3Gen, or persona-conditioning paths described above.
+The API status identifies its local mode as `api_watermark_mode`; buffered synthesis responses carry
+`X-Worker-Watermark-Modes` so deployments can verify the effective GPU-worker mode.
+
+## Turbo fast path
+
+`turbo_runtime_optimizations.py` applies an exact-output compatibility layer before any engine is
+constructed. Inspired by the conditioning cache and persistent serving design in
+`groxaxo/chatterbox-vllm2`, it caches each T3 engine's final encoded conditionals and removes repeated
+token-history allocation and progress rendering from Turbo decoding. It does not transplant vLLM,
+change attention, alter sampling, reduce MeanFlow steps, or change precision. Source fingerprints
+fail startup if the pinned upstream methods change while the fast path is enabled.
+
+English and every Spanish profile retain separate T3 instances and therefore separate encoded
+conditioning caches. Worker response metadata reports the effective fast-path mode.
+Local base-model overrides are validated for the three Turbo weight files and the tokenizer
+configuration, vocabulary, merges, and special-token map before engine construction.
+The Celery entrypoint performs model load and warmup during module bootstrap, before worker readiness.
+Bootstrap exceptions are intentionally not swallowed, so systemd restarts a failed worker rather than
+leaving a queue consumer that cannot synthesize.
+
 ## Shared components
 
 Each Spanish profile is first constructed with a temporary CPU loader. Only its final T3 is retained.
@@ -67,7 +94,7 @@ It owns its own:
 
 - merged or PEFT-wrapped T3;
 - Lucía conditionals;
-- watermarker instance.
+- configured watermarker instance (the default is the no-op adapter described above).
 
 This avoids loading a full decoder and voice encoder for every profile.
 

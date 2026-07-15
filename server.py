@@ -25,7 +25,21 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from chatterbox.tts_turbo import ChatterboxTurboTTS
+import chatterbox.tts_turbo as chatterbox_tts_turbo
+
+from watermark_control import configure_watermarking
+from turbo_runtime_optimizations import configure_turbo_runtime
+
+
+ENABLE_WATERMARK = os.getenv("ENABLE_WATERMARK", "0") == "1"
+WATERMARK_MODE = configure_watermarking(chatterbox_tts_turbo, enabled=ENABLE_WATERMARK)
+ENABLE_TURBO_FAST_PATH = os.getenv("ENABLE_TURBO_FAST_PATH", "1") == "1"
+TURBO_OPTIMIZATION_STATE = configure_turbo_runtime(
+    chatterbox_tts_turbo,
+    enabled=ENABLE_TURBO_FAST_PATH,
+    conditioning_cache_size=int(os.getenv("VOICE_CACHE_SIZE", "8")),
+)
+ChatterboxTurboTTS = chatterbox_tts_turbo.ChatterboxTurboTTS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +47,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger("chatterbox_api")
+logger.info("Chatterbox watermark mode: %s", WATERMARK_MODE)
+logger.info("Chatterbox Turbo fast path: %s", TURBO_OPTIMIZATION_STATE.mode)
 
 
 # -----------------------------
@@ -208,6 +224,13 @@ def resolve_default_voice_path() -> Optional[Path]:
 
 def configured_worker_count() -> int:
     return max(1, len(WORKER_GPU_INDEX_LIST))
+
+
+def current_t3_attention_backend() -> str:
+    if model is None:
+        return "unloaded"
+    config = getattr(getattr(getattr(model, "t3", None), "tfmr", None), "config", None)
+    return str(getattr(config, "_attn_implementation", "unknown"))
 
 
 def unload_model_locked(reason: str) -> None:
@@ -842,9 +865,6 @@ def generate_chunk_locked(
             )
 
         sample_rate = int(loaded_model.sr)
-        if DEVICE.startswith("cuda"):
-            torch.cuda.synchronize()
-
         touch_model_usage()
         return tensor_to_float_array(wav), sample_rate, voice_cache_hit
 
@@ -912,6 +932,7 @@ def synthesize_request_sync(
         "chunk_hard_limit": AUTO_CHUNK_HARD_LIMIT,
         "lazy_loaded": LAZY_LOAD_MODEL,
         "model_loaded": model is not None,
+        "process_warmup_complete": worker_warmup_complete,
         "output_format": output_format,
         "content_type": content_type,
         "filename": f"speech.{extension}",
@@ -970,6 +991,11 @@ def synthesize_single_chunk_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "pcm16_path": str(pcm_path),
                 "worker_id": worker_id,
                 "worker_cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
+                "worker_watermark_mode": WATERMARK_MODE,
+                "worker_turbo_fast_path": TURBO_OPTIMIZATION_STATE.mode,
+                "worker_t3_attention_backend": current_t3_attention_backend(),
+                "worker_warmup_complete": worker_warmup_complete,
+                "worker_chatterbox_version": TURBO_OPTIMIZATION_STATE.package_version,
             }
         ],
     }
@@ -1003,6 +1029,11 @@ def synthesize_chunk_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "pcm16_path": str(pcm_path),
                 "worker_id": worker_id,
                 "worker_cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
+                "worker_watermark_mode": WATERMARK_MODE,
+                "worker_turbo_fast_path": TURBO_OPTIMIZATION_STATE.mode,
+                "worker_t3_attention_backend": current_t3_attention_backend(),
+                "worker_warmup_complete": worker_warmup_complete,
+                "worker_chatterbox_version": TURBO_OPTIMIZATION_STATE.package_version,
             }
         )
 
@@ -1029,6 +1060,16 @@ def response_with_audio(audio_bytes: bytes, meta: dict[str, Any]) -> Response:
     }
     if meta.get("chunk_worker_counts"):
         headers["X-Chunk-Worker-Counts"] = json.dumps(meta["chunk_worker_counts"], sort_keys=True)
+    if meta.get("worker_watermark_modes"):
+        headers["X-Worker-Watermark-Modes"] = ",".join(meta["worker_watermark_modes"])
+    if meta.get("worker_turbo_fast_paths"):
+        headers["X-Worker-Turbo-Fast-Paths"] = ",".join(meta["worker_turbo_fast_paths"])
+    if meta.get("worker_t3_attention_backends"):
+        headers["X-Worker-T3-Attention-Backends"] = ",".join(meta["worker_t3_attention_backends"])
+    if meta.get("worker_warmup_states"):
+        headers["X-Worker-Warmup-States"] = ",".join(meta["worker_warmup_states"])
+    if meta.get("worker_chatterbox_versions"):
+        headers["X-Worker-Chatterbox-Versions"] = ",".join(meta["worker_chatterbox_versions"])
     if meta.get("rtf") is not None:
         headers["X-RTF"] = str(meta["rtf"])
     if meta.get("x_realtime") is not None:
@@ -1090,6 +1131,9 @@ def runtime_status(include_sensitive: bool = True) -> dict[str, Any]:
         "gpu": gpu,
         "expected_gpu_name": EXPECTED_GPU_NAME or ("RTX 3060" if ENABLE_CELERY else None),
         "model_loaded": model is not None,
+        "process_warmup_complete": worker_warmup_complete,
+        "startup_warmup_enabled": STARTUP_WARMUP,
+        "process_t3_attention_backend": current_t3_attention_backend(),
         "lazy_load_model": LAZY_LOAD_MODEL,
         "model_idle_unload_seconds": MODEL_IDLE_UNLOAD_SECONDS,
         "sample_rate": int(model.sr) if model else 24000,
@@ -1100,6 +1144,11 @@ def runtime_status(include_sensitive: bool = True) -> dict[str, Any]:
         "chunk_hard_limit": AUTO_CHUNK_HARD_LIMIT,
         "auto_chunk_enabled": AUTO_CHUNK_ENABLED,
         "default_response_format": DEFAULT_RESPONSE_FORMAT,
+        "watermark_enabled": ENABLE_WATERMARK,
+        "api_watermark_mode": WATERMARK_MODE,
+        "turbo_fast_path_enabled": ENABLE_TURBO_FAST_PATH,
+        "api_turbo_fast_path": TURBO_OPTIMIZATION_STATE.mode,
+        "api_chatterbox_version": TURBO_OPTIMIZATION_STATE.package_version,
         "worker_gpu_indices": WORKER_GPU_INDICES or None,
         "worker_count": configured_worker_count() if ENABLE_CELERY else None,
         "max_parallel_chunk_tasks": MAX_CELERY_PARALLEL_TASKS if ENABLE_CELERY else None,
@@ -1285,6 +1334,46 @@ def finalize_chunk_payloads(
         voice_cache_hits: list[bool] = []
         indices_seen: list[int] = []
         worker_ids: list[str] = []
+        worker_watermark_modes = sorted(
+            {
+                str(item.get("worker_watermark_mode") or "unknown")
+                for payload in payloads
+                for item in payload.get("items", [])
+                if isinstance(item, dict)
+            }
+        )
+        worker_turbo_fast_paths = sorted(
+            {
+                str(item.get("worker_turbo_fast_path") or "unknown")
+                for payload in payloads
+                for item in payload.get("items", [])
+                if isinstance(item, dict)
+            }
+        )
+        worker_t3_attention_backends = sorted(
+            {
+                str(item.get("worker_t3_attention_backend") or "unknown")
+                for payload in payloads
+                for item in payload.get("items", [])
+                if isinstance(item, dict)
+            }
+        )
+        worker_warmup_states = sorted(
+            {
+                str(bool(item.get("worker_warmup_complete"))).lower()
+                for payload in payloads
+                for item in payload.get("items", [])
+                if isinstance(item, dict)
+            }
+        )
+        worker_chatterbox_versions = sorted(
+            {
+                str(item.get("worker_chatterbox_version") or "unknown")
+                for payload in payloads
+                for item in payload.get("items", [])
+                if isinstance(item, dict)
+            }
+        )
 
         for index, raw, sample_rate, voice_cached, _artifact_path, worker_id in chunk_results:
             if index < 0:
@@ -1329,6 +1418,11 @@ def finalize_chunk_payloads(
             "chunk_target_chars": AUTO_CHUNK_TARGET_CHARS,
             "chunk_hard_limit": AUTO_CHUNK_HARD_LIMIT,
             "chunk_worker_counts": dict(sorted(Counter(worker_ids).items())),
+            "worker_watermark_modes": worker_watermark_modes,
+            "worker_turbo_fast_paths": worker_turbo_fast_paths,
+            "worker_t3_attention_backends": worker_t3_attention_backends,
+            "worker_warmup_states": worker_warmup_states,
+            "worker_chatterbox_versions": worker_chatterbox_versions,
             "output_format": output_format,
             "content_type": content_type,
             "filename": f"speech.{extension}",
