@@ -32,10 +32,14 @@ def requirements(name: str):
     except importlib.metadata.PackageNotFoundError:
         return []
 
+
 payload = {
     "platform": platform.platform(),
     "python": platform.python_version(),
     "torch": torch.__version__,
+    "torch_tensorrt": version("torch-tensorrt"),
+    "tensorrt": version("tensorrt"),
+    "vllm": version("vllm"),
     "transformers": version("transformers"),
     "chatterbox_tts": version("chatterbox-tts"),
     "chatterbox_declared_requirements": requirements("chatterbox-tts"),
@@ -59,6 +63,21 @@ payload = {
             "TURBO_DISABLE_PROGRESS",
             "TURBO_STRICT_LOGIT_CHECKS",
             "TURBO_EXPECTED_CHATTERBOX_VERSION",
+            "TURBO_EXPECTED_CHATTERBOX_VERSIONS",
+            "TURBO_ACCELERATOR",
+            "TURBO_ACCELERATOR_FAIL_CLOSED",
+            "TURBO_TENSORRT_BACKEND",
+            "TURBO_TENSORRT_DYNAMIC",
+            "TURBO_TENSORRT_FULLGRAPH",
+            "TURBO_TENSORRT_REQUIRE_FP32",
+            "TURBO_VLLM_BASE_URL",
+            "TURBO_VLLM_HEALTH_PATH",
+            "TURBO_VLLM_SPEECH_PATH",
+            "TURBO_VLLM_MODEL",
+            "TURBO_VLLM_PROFILES",
+            "TURBO_VLLM_VOICE_MAP",
+            "TURBO_VLLM_TIMEOUT_SECONDS",
+            "TURBO_VLLM_EXCLUSIVE",
             "MODEL_IDLE_UNLOAD_SECONDS",
         )
     },
