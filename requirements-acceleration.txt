@@ -1,0 +1,4 @@
+# Optional worker-only acceleration dependencies. Install with ./install_tensorrt.sh.
+# vLLM deliberately runs in a separate environment/process and is not installed here.
+torch-tensorrt==2.6.1
+tensorrt
