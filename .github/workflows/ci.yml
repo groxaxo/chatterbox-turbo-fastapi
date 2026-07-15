@@ -29,15 +29,20 @@ jobs:
             celery_worker.py \
             multilingual_runtime.py \
             chaturbo_espanol_runtime.py \
+            performance_support.py \
+            performance_patches.py \
+            performance_runtime.py \
             multilingual_server.py \
             multilingual_celery_worker.py \
-            download_models.py
+            download_models.py \
+            benchmarks/benchmark_parity.py
       - name: Validate shell scripts
         run: |
           bash -n install_cuda124.sh
           bash -n install_systemd_services.sh
           bash -n run_api_service.sh
           bash -n run_celery_worker.sh
+          bash -n scripts/capture_runtime_manifest.sh
           bash -n test_curl.sh
       - name: Run unit tests
         run: pytest -q 2>&1 | tee pytest.log
