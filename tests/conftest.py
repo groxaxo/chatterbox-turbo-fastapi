@@ -33,6 +33,18 @@ def _install_torch_stub() -> None:
     nn = ModuleType("torch.nn")
     functional = ModuleType("torch.nn.functional")
     functional.softmax = lambda value, dim=-1: value
+
+    class Module:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def eval(self):
+            return self
+
+        def parameters(self):
+            return iter(())
+
+    nn.Module = Module
     nn.functional = functional
 
     torch.nn = nn
