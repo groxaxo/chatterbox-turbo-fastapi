@@ -1,0 +1,5 @@
+# Version-sensitive worker-only acceleration dependencies.
+#
+# Do not install this file directly. Run ./install_tensorrt.sh so the selected
+# torch-tensorrt release matches the worker's already-installed Torch major/minor
+# and CUDA wheel family. vLLM deliberately runs in a separate environment/process.

@@ -20,6 +20,17 @@ _resolve_t3_core = resolve_t3_core
 _distribution_version = distribution_version
 
 
+def _expected_chatterbox_versions() -> tuple[str, ...]:
+    """Resolve the compatibility allowlist while preserving the legacy single-value flag."""
+
+    legacy = os.getenv("TURBO_EXPECTED_CHATTERBOX_VERSION")
+    raw = legacy if legacy is not None else os.getenv(
+        "TURBO_EXPECTED_CHATTERBOX_VERSIONS",
+        "0.1.6,0.1.7",
+    )
+    return tuple(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
+
+
 class TurboPerformanceRuntime:
     """Install exact-output-oriented Turbo optimizations after multilingual routing."""
 
@@ -34,21 +45,27 @@ class TurboPerformanceRuntime:
         self.strict_logit_checks = env_bool("TURBO_STRICT_LOGIT_CHECKS", True)
         self.rewrite_package_generate = env_bool("TURBO_REWRITE_PACKAGE_GENERATE", True)
         self.fail_on_incompatible_package = env_bool("TURBO_FAIL_ON_INCOMPATIBLE_PACKAGE", False)
-        self.expected_package_version = os.getenv("TURBO_EXPECTED_CHATTERBOX_VERSION", "0.1.6").strip()
+        self.expected_package_versions = _expected_chatterbox_versions()
+        # Kept for status/API compatibility with older deployments.
+        self.expected_package_version = ",".join(self.expected_package_versions)
         self.conditioning_cache_size = max(1, int(os.getenv(
             "TURBO_ENCODED_CONDITION_CACHE_SIZE",
             str(max(1, getattr(server_module, "VOICE_CACHE_SIZE", 8))),
         )))
         self.chatterbox_version = _distribution_version("chatterbox-tts")
         self.transformers_version = _distribution_version("transformers")
-        self.package_compatible = not self.expected_package_version or self.chatterbox_version == self.expected_package_version
+        self.package_compatible = (
+            not self.expected_package_versions
+            or self.chatterbox_version in self.expected_package_versions
+        )
         self.optimizer = EngineOptimizer(self)
         self._original_generate_chunk_locked: Optional[Callable[..., Any]] = None
         self._original_unload_model_locked: Optional[Callable[..., Any]] = None
         self._original_runtime_status: Optional[Callable[..., Any]] = None
         if not self.package_compatible:
+            expected = ", ".join(self.expected_package_versions) or "any"
             message = (
-                f"Turbo rewrites expect chatterbox-tts {self.expected_package_version}; "
+                f"Turbo rewrites expect chatterbox-tts in [{expected}]; "
                 f"installed={self.chatterbox_version or 'unknown'}. Falling back to package code."
             )
             if self.fail_on_incompatible_package:
@@ -145,6 +162,7 @@ class TurboPerformanceRuntime:
             "enabled": self.enabled,
             "classification": "E0 valid-path exact",
             "expected_chatterbox_version": self.expected_package_version,
+            "expected_chatterbox_versions": list(self.expected_package_versions),
             "package_compatible": self.package_compatible,
             "runtime": {
                 "python": platform.python_version(), "torch": torch.__version__,
