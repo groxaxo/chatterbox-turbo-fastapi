@@ -11,7 +11,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from benchmarks.benchmark_parity import _build_comparison
+try:
+    from benchmarks.benchmark_parity import _build_comparison
+except ModuleNotFoundError:  # Direct execution: python benchmarks/benchmark_acceleration.py
+    from benchmark_parity import _build_comparison
 
 
 def _capture_env(accelerator: str) -> dict[str, str]:
