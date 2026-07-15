@@ -340,9 +340,20 @@ def _build_comparison(baseline: dict[str, Any], optimized: dict[str, Any]) -> di
     }
 
 
+def _deterministic_capture_env(*, performance_enabled: bool) -> dict[str, str]:
+    return {
+        **os.environ,
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "PYTHONHASHSEED": "0",
+        "TURBO_PARITY_DETERMINISTIC": "1",
+        "TURBO_PERFORMANCE_RUNTIME": "1" if performance_enabled else "0",
+    }
+
+
 def compare(args: argparse.Namespace) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     baseline_path = args.output_dir / "baseline.json"
+    baseline_repeat_path = args.output_dir / "baseline-repeat.json"
     optimized_path = args.output_dir / "optimized.json"
     report_path = args.output_dir / "comparison.json"
 
@@ -358,23 +369,34 @@ def compare(args: argparse.Namespace) -> int:
     subprocess.run(
         base_command + ["--mode", "baseline", "--output", str(baseline_path)],
         check=True,
-        env={**os.environ, "TURBO_PERFORMANCE_RUNTIME": "0"},
+        env=_deterministic_capture_env(performance_enabled=False),
+    )
+    subprocess.run(
+        base_command + ["--mode", "baseline", "--output", str(baseline_repeat_path)],
+        check=True,
+        env=_deterministic_capture_env(performance_enabled=False),
     )
     subprocess.run(
         base_command + ["--mode", "optimized", "--output", str(optimized_path)],
         check=True,
-        env={**os.environ, "TURBO_PERFORMANCE_RUNTIME": "1"},
+        env=_deterministic_capture_env(performance_enabled=True),
     )
 
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline_repeat = json.loads(baseline_repeat_path.read_text(encoding="utf-8"))
     optimized = json.loads(optimized_path.read_text(encoding="utf-8"))
     comparison = _build_comparison(baseline, optimized)
+    baseline_reproducibility = _build_comparison(baseline, baseline_repeat)
+    comparison["baseline_reproducibility"] = baseline_reproducibility
     report_path.write_text(
         json.dumps(comparison, indent=2, sort_keys=True),
         encoding="utf-8",
     )
     print(report_path)
 
+    if not baseline_reproducibility["exact"] and not args.allow_drift:
+        print("ERROR: deterministic baseline is not reproducible across isolated processes", file=sys.stderr)
+        return 3
     if not comparison["exact"] and not args.allow_drift:
         print("ERROR: exact token/waveform parity failed", file=sys.stderr)
         return 2

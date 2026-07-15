@@ -183,10 +183,17 @@ def configure_torch() -> str:
                     f"Selected GPU '{gpu_name}' does not match EXPECTED_GPU_NAME='{EXPECTED_GPU_NAME}'."
                 )
 
-            # RTX 3060 / 3090 are Ampere. TF32 improves matmul/conv speed with negligible TTS impact.
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
+            if os.getenv("TURBO_PARITY_DETERMINISTIC", "0") == "1":
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.allow_tf32 = False
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+                torch.use_deterministic_algorithms(True)
+            else:
+                # RTX 3060 / 3090 are Ampere. TF32 improves production matmul/conv throughput.
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
 
     device_configured = True
     return DEVICE

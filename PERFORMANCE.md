@@ -97,7 +97,10 @@ An explicit destination is also supported:
 
 ## Exact-parity benchmark
 
-The benchmark launches baseline and optimized captures in isolated Python processes. It records:
+The benchmark launches two baseline captures and one optimized capture in isolated Python processes.
+It enables deterministic CUDA algorithms, disables TF32/cuDNN autotuning for the parity gate, and
+pins the cuBLAS workspace configuration before CUDA initialization. Candidate approval requires both
+baseline-to-baseline reproducibility and baseline-to-candidate parity. It records:
 
 - engine-load, generation, conditioning, T3, S3, and PCM conversion timings;
 - CUDA-event timings where CUDA is available;
@@ -125,6 +128,7 @@ The command exits non-zero when speech-token, float-waveform, PCM16, sample-rate
 
 ```text
 artifacts/turbo-parity/baseline.json
+artifacts/turbo-parity/baseline-repeat.json
 artifacts/turbo-parity/optimized.json
 artifacts/turbo-parity/comparison.json
 ```
