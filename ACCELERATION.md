@@ -30,7 +30,25 @@ Activate the same environment used by the Celery worker, then run:
 ./install_tensorrt.sh
 ```
 
-The recipe pins `torch-tensorrt==2.6.1` to match the repository's Torch 2.6 generation. It does not reinstall Torch.
+The installer reads the already-installed Torch and CUDA runtime, selects a reviewed matching Torch-TensorRT release, derives the correct PyTorch CUDA wheel index, and verifies that installation did not change Torch. The reviewed mappings are:
+
+| Installed Torch family | Torch-TensorRT |
+|---|---|
+| 2.6 | 2.6.1 |
+| 2.7 | 2.7.0 |
+| 2.8 | 2.8.0 |
+| 2.9 | 2.9.0 |
+| 2.10 | 2.10.0 |
+| 2.11 | 2.11.0 |
+| 2.12 | 2.12.1 |
+
+An unknown future Torch family fails safely. After reviewing upstream compatibility, it can be supplied explicitly:
+
+```bash
+TORCH_TENSORRT_VERSION=2.13.0 ./install_tensorrt.sh
+```
+
+A custom wheel index can also be supplied with `TORCH_TENSORRT_INDEX_URL`. The installer rejects a Torch-TensorRT version whose major/minor does not match the installed Torch family.
 
 ### 2. Run the strict parity gate
 
@@ -125,9 +143,11 @@ export TURBO_ACCELERATOR_FAIL_CLOSED=0
 
 With `TURBO_VLLM_EXCLUSIVE=0`, the local PyTorch engine remains warm and receives unsupported profiles or sidecar failures. This consumes more VRAM, so the recommended production topology is a sidecar on a different GPU/process. Set exclusive mode only after accepting that local fallback and Lucía routing are unavailable on that worker.
 
+A custom `audio_prompt_path` works only when the sidecar can read the same absolute path, such as on the same host or a shared mount.
+
 ### 3. Quality and throughput gate
 
-vLLM is not part of the strict byte-parity gate because its scheduler, RNG stream, token offset model, and sampling implementation are distinct. Before routing production traffic, compare:
+vLLM is not part of the strict byte-parity gate because its scheduler, RNG stream, token-offset model, and sampling implementation are distinct. Before routing production traffic, compare:
 
 - transcript WER/CER on English and any explicitly enabled profile;
 - speaker-embedding cosine similarity;
@@ -136,7 +156,7 @@ vLLM is not part of the strict byte-parity gate because its scheduler, RNG strea
 - throughput at concurrency 1, 2, 4, and 8;
 - fallback and failure counters in `/status`.
 
-The bridge forwards temperature, top-p, repetition penalty, seed, voice, and reference path when supported. `top_k` and cross-runtime RNG parity are explicitly not guaranteed and are reported in status metadata.
+The bridge forwards temperature, top-p, repetition penalty, voice, and the reference path supported by the sidecar. Local `top_k`, seed reproduction, and cross-runtime RNG parity are explicitly not guaranteed and are reported in status metadata.
 
 ### vLLM rollback
 
@@ -153,8 +173,8 @@ Restart the worker. The sidecar can then be stopped independently.
 | `TURBO_ACCELERATOR` | `torch` | `torch`, `tensorrt`, or `vllm` |
 | `TURBO_ACCELERATOR_FAIL_CLOSED` | `0` | Raise instead of using the local fallback |
 | `TURBO_TENSORRT_BACKEND` | `torch_tensorrt` | Torch Dynamo backend name |
-| `TURBO_TENSORRT_DYNAMIC` | `0` | Permit dynamic speech lengths |
-| `TURBO_TENSORRT_FULLGRAPH` | `0` | Avoid requiring a single full graph |
+| `TURBO_TENSORRT_DYNAMIC` | `0` | Enable symbolic dynamic-shape compilation |
+| `TURBO_TENSORRT_FULLGRAPH` | `0` | Require one complete compiled graph when enabled |
 | `TURBO_TENSORRT_REQUIRE_FP32` | `1` | Reject reduced-precision HiFT parameters |
 | `TURBO_VLLM_BASE_URL` | `http://127.0.0.1:8000` | Sidecar origin |
 | `TURBO_VLLM_HEALTH_PATH` | `/health` | Bootstrap health check |
